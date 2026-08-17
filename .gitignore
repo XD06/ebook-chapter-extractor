@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 缓存与生成物
+.cache/
+*.png
+*.pdf
+*.md.html
+
+# 环境变量与密钥
+.env
+.env.*
+*.local
+config.yaml
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
