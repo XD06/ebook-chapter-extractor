@@ -15,32 +15,55 @@ import tempfile
 import subprocess
 from typing import Optional, Union, Dict, Any, List
 
+
 def is_windows() -> bool:
     return sys.platform.startswith("win")
 
+
+def get_cache_dir(file_path: str, sub_name: str = "") -> str:
+    """获取缓存目录，源目录只读或无权限时自动优雅降级到系统临时目录"""
+    base_dir = os.path.dirname(os.path.abspath(file_path))
+    target_dir = os.path.join(base_dir, ".cache")
+    if sub_name:
+        target_dir = os.path.join(target_dir, sub_name)
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        test_file = os.path.join(target_dir, ".perm_test")
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(test_file)
+        return target_dir
+    except (PermissionError, OSError):
+        fallback = os.path.join(tempfile.gettempdir(), ".ebook_cache")
+        if sub_name:
+            fallback = os.path.join(fallback, sub_name)
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
+
 def detect_image_ext(data: bytes) -> str:
-    """根据文件头字节识别图像格式扩展名"""
+    """根据文件头 Magic Number 检测图片真实后缀"""
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return ".png"
-    elif data.startswith(b"\xff\xd8\xff"):
-        return ".jpg"
-    elif data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
         return ".gif"
-    elif data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
         return ".webp"
-    elif data.startswith(b"BM"):
+    if data.startswith(b"BM"):
         return ".bmp"
-    elif data.startswith(b"II*\x00") or data.startswith(b"MM\x00*"):
+    if data.startswith(b"II*\x00") or data.startswith(b"MM\x00*"):
         return ".tif"
+    if data.startswith(b"<svg") or b"<svg" in data[:100]:
+        return ".svg"
     return ".png"
 
-_RAPIDOCR_INSTANCE = None
-_WINRT_AVAILABLE = None
 
 def detect_ocr_engine() -> str:
-    """自动嗅探当前环境可用的最佳 OCR 引擎"""
+    """探测当前环境下可用的 OCR 引擎"""
     try:
-        import rapidocr_onnxruntime
+        import rapidocr_onnxruntime  # noqa: F401
         return "rapidocr"
     except ImportError:
         pass
@@ -49,18 +72,22 @@ def detect_ocr_engine() -> str:
         return "win_ocr"
 
     try:
-        import pytesseract
+        import pytesseract  # noqa: F401
         return "pytesseract"
     except ImportError:
         pass
 
     try:
-        import easyocr
+        import easyocr  # noqa: F401
         return "easyocr"
     except ImportError:
         pass
 
     return "none"
+
+
+_RAPIDOCR_INSTANCE = None
+
 
 def get_rapidocr():
     global _RAPIDOCR_INSTANCE
@@ -68,9 +95,10 @@ def get_rapidocr():
         try:
             from rapidocr_onnxruntime import RapidOCR
             _RAPIDOCR_INSTANCE = RapidOCR()
-        except Exception as e:
+        except Exception:
             _RAPIDOCR_INSTANCE = False
     return _RAPIDOCR_INSTANCE if _RAPIDOCR_INSTANCE is not False else None
+
 
 def ocr_image_rapidocr(image_input: Union[str, bytes]) -> str:
     engine = get_rapidocr()
@@ -80,12 +108,12 @@ def ocr_image_rapidocr(image_input: Union[str, bytes]) -> str:
         result, _ = engine(image_input)
         if not result:
             return ""
-        # RapidOCR 返回格式: [[box, text, score], ...]
         lines = [item[1] for item in result if item and len(item) >= 2 and item[1].strip()]
         return "\n".join(lines)
     except Exception as e:
         sys.stderr.write(f"RapidOCR recognition error: {e}\n")
         return ""
+
 
 def ocr_image_winrt(image_path: str) -> str:
     """Windows 原生 WinRT OCR (PowerShell 兜底调用)"""
@@ -125,6 +153,7 @@ $ocrResult.Text
         sys.stderr.write(f"WinRT OCR error: {e}\n")
         return ""
 
+
 def ocr_image_pytesseract(image_input: Union[str, bytes]) -> str:
     try:
         import pytesseract
@@ -138,6 +167,7 @@ def ocr_image_pytesseract(image_input: Union[str, bytes]) -> str:
     except Exception as e:
         sys.stderr.write(f"Pytesseract error: {e}\n")
         return ""
+
 
 def ocr_image(image_input: Union[str, bytes], engine_name: Optional[str] = None) -> str:
     """对单张图片执行 OCR 识别"""
@@ -177,30 +207,61 @@ def ocr_image(image_input: Union[str, bytes], engine_name: Optional[str] = None)
     return ""
 
 
+def clean_ocr_text(text: str) -> str:
+    """
+    通用 OCR 文本清洗与规范化：
+    1. 清除控制字符、零宽空格、不可见 Unicode 乱码
+    2. 规范化代码上下文中的全角标点符号 (（）［］｛｝ 等)
+    3. 修复被 OCR 拆开的注释符号 (/ / -> //, / * -> /*) 与赋值符 (: = -> :=)
+    """
+    if not text:
+        return ""
+
+    # 清除控制字符 (保留 \n, \r, \t)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufeff\u200b\ufffd]", "", text)
+
+    lines = text.splitlines()
+    cleaned = []
+    for line in lines:
+        l = line
+        # 修复拆分的注释与运算符
+        l = re.sub(r'(^|\s)/[ \t]+/(?=\s|$|[a-zA-Z\u4e00-\u9fa5])', r'\1//', l)
+        l = re.sub(r'(^|\s)/[ \t]+\*', r'\1/*', l)
+        l = re.sub(r'\*[ \t]+/(?=\s|$)', r'*/', l)
+        l = re.sub(r'(\w|\s)[:：][ \t]*=(?=\s|\w)', r'\1:=', l)
+
+        # 在代码/表达式特征明显的行中，规范化全角标点
+        is_code_like = bool(re.search(r"(:=|\b(func|var|import|package|int|float|string|return|if|for|switch|class|def|struct)\b|[;{}()=<>+\-*/&|])", l))
+        if is_code_like:
+            l = l.replace("（", "(").replace("）", ")")
+            l = l.replace("［", "[").replace("］", "]")
+            l = l.replace("｛", "{").replace("｝", "}")
+            l = l.replace("“", '"').replace("”", '"')
+            l = l.replace("‘", "'").replace("’", "'")
+
+        cleaned.append(l)
+
+    return "\n".join(cleaned)
+
+
 def clean_code_ocr(text: str) -> str:
     """
     针对 OCR 提取的代码做轻量启发式自愈与清洗：
     1. 修正尖括号与问号: <iostream? -> <iostream>
-    2. 修正末尾分号与冒号误识: std: -> std; / 0 : -> 0; / endl : -> endl;
+    2. 修正末尾分号与冒号误认: std: -> std; / 0 : -> 0; / endl : -> endl;
     3. 清洗空行与异常断行
+    4. 修复常见关键字粘连与注释符号
     """
+    text = clean_ocr_text(text)
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     cleaned_lines = []
 
     for line in lines:
-        # 修正常见的 include 尖括号误识
         line = re.sub(r'#include\s*<([^>]+)[\?？]', r'#include <\1>', line)
         line = re.sub(r'#include\s*<([^>]+)$', r'#include <\1>', line)
-
-        # 修正 using namespace std: -> using namespace std;
         line = re.sub(r'(using\s+namespace\s+std)\s*[:：]', r'\1;', line)
-
-        # 修正 return 0 : -> return 0;
         line = re.sub(r'(return\s+\d+)\s*[:：]', r'\1;', line)
-
-        # 修正 endl : -> endl;
         line = re.sub(r'(endl)\s*[:：]', r'\1;', line)
-
         cleaned_lines.append(line)
 
     return "\n".join(cleaned_lines)
@@ -216,13 +277,12 @@ def format_ocr_markdown(ocr_text: str, alt_text: str = "", image_rel_path: Optio
             return f"\n![{alt_text}]({image_rel_path})\n"
         return ""
 
-    text = ocr_text.strip()
+    text = clean_ocr_text(ocr_text.strip())
 
-    # 启发式判断是否像程序代码
     code_keywords = [
         "#include", "int main", "void ", "std::", "cout", "cin", "def ", "class ",
         "return ", "import ", "public class", "fn ", "let ", "const ", "var ",
-        "struct ", "typedef", "printf(", "scanf("
+        "struct ", "typedef", "printf(", "scanf(", "func ", "package ", ":="
     ]
     is_code = any(kw in text for kw in code_keywords) or (
         ("{" in text and "}" in text) or (";" in text and len(text.splitlines()) >= 3)
@@ -234,7 +294,15 @@ def format_ocr_markdown(ocr_text: str, alt_text: str = "", image_rel_path: Optio
 
     if is_code:
         text = clean_code_ocr(text)
-        lang = "cpp" if any(k in text for k in ["#include", "cout", "std::", "int main"]) else ""
+        lang = ""
+        if any(k in text for k in ["#include", "cout", "std::"]):
+            lang = "cpp"
+        elif any(k in text for k in ["func ", "package ", "fmt.", "os.Open", "flag."]):
+            lang = "go"
+        elif any(k in text for k in ["def ", "import ", "print(", "__init__"]):
+            lang = "python"
+        elif any(k in text for k in ["printf(", "scanf(", "int main", "char *"]):
+            lang = "c"
         return f"\n{header}\n```{lang}\n{text}\n```\n"
     else:
         quoted = "\n> ".join(text.splitlines())

@@ -29,7 +29,7 @@ try:
 except ImportError:
     html2text = None
 
-from ocr_helper import detect_image_ext, ocr_image, format_ocr_markdown
+from ocr_helper import detect_image_ext, ocr_image, format_ocr_markdown, get_cache_dir
 from mathml_helper import convert_soup_mathml_to_latex
 
 
@@ -71,35 +71,83 @@ def _strip_ns(tag: str) -> str:
 
 def enhance_pre_code_tags(soup: BeautifulSoup) -> None:
     """
-    预处理 HTML 中的 <pre> / <code> 标签，将其规范化为标准的 fenced code block 格式，
-    防止被 markdown 转换器错误折行或退化为普通文本。
+    预处理 HTML 中的代码块结构 (<pre>, <code>, <tt>, 以及等宽字体、类名标有 code/program/listing 的元素)，
+    将其规范化为标准的 fenced code block 格式，防止被 markdown 转换器错误折行或退化为普通文本。
     """
-    for pre in soup.find_all("pre"):
+    if not soup:
+        return
+
+    def detect_lang(classes: list, text: str) -> str:
+        c_str = " ".join(classes).lower()
+        if "cpp" in c_str or "c++" in c_str:
+            return "cpp"
+        if "golang" in c_str or "go" in c_str.split():
+            return "go"
+        if "python" in c_str or "py" in c_str.split():
+            return "python"
+        if "java" in c_str.split():
+            return "java"
+        if "rust" in c_str.split() or "rs" in c_str.split():
+            return "rust"
+        if "javascript" in c_str or "js" in c_str.split() or "typescript" in c_str or "ts" in c_str.split():
+            return "javascript"
+        if "bash" in c_str or "sh" in c_str.split() or "shell" in c_str:
+            return "bash"
+        if "sql" in c_str.split():
+            return "sql"
+        if "html" in c_str.split() or "xml" in c_str.split():
+            return "html"
+        if "c" in c_str.split():
+            return "c"
+        if "#include" in text or "std::" in text or "cout <<" in text:
+            return "cpp"
+        if "package " in text and ("func " in text or "import (" in text or ":=" in text):
+            return "go"
+        if "def " in text and (":" in text or "import " in text or "print(" in text):
+            return "python"
+        if "printf(" in text or "int main(" in text or "char *" in text:
+            return "c"
+        return ""
+
+    # 1. 处理标准的 <pre> 块
+    for pre in list(soup.find_all("pre")):
         code_tag = pre.find("code")
-        lang = ""
-        # 尝试从 class 提取语言，如 class="language-cpp" 或 class="brush: cpp"
         classes = pre.get("class", [])
         if code_tag and code_tag.get("class"):
-            classes += code_tag.get("class", [])
-        for c in classes:
-            if "cpp" in c or "c++" in c:
-                lang = "cpp"
-                break
-            elif "python" in c or "py" in c:
-                lang = "python"
-                break
-            elif "java" in c:
-                lang = "java"
-                break
-            elif "c" == c:
-                lang = "c"
-                break
-
-        # 提取纯文本代码内容
+            classes = classes + code_tag.get("class", [])
         code_text = pre.get_text()
-        # 转换为自定义安全标记，避免 html2text 丢失缩进
-        # 如果是标准 pre，保留其内部换行
+        lang = detect_lang(classes, code_text)
         pre.string = f"\n```{lang}\n{code_text.strip()}\n```\n"
+
+    # 2. 处理 class 名带 code / program / listing / monospace 或含有 monospace 样式的 div / p
+    code_selectors = ["div", "p"]
+    for tag in list(soup.find_all(code_selectors)):
+        if tag.find_parent("pre"):
+            continue
+        classes = tag.get("class", [])
+        c_str = " ".join(classes).lower()
+        style = (tag.get("style") or "").lower()
+
+        is_code_container = any(kw in c_str for kw in ["code", "program", "listing", "syntax", "snippet", "monospace"]) or \
+                            any(kw in style for kw in ["monospace", "courier", "consolas", "menlo"])
+
+        if is_code_container:
+            code_text = tag.get_text()
+            if code_text.strip() and (len(code_text.splitlines()) >= 2 or any(kw in code_text for kw in [";", "{", "}", "()", "def ", "func ", "int ", "#include"])):
+                lang = detect_lang(classes, code_text)
+                tag.string = f"\n```{lang}\n{code_text.strip()}\n```\n"
+
+    # 3. 处理 <font face="monospace|Courier|Consolas"> 或多行 <tt>
+    for font_or_tt in list(soup.find_all(["font", "tt"])):
+        if font_or_tt.find_parent("pre"):
+            continue
+        face = (font_or_tt.get("face") or "").lower()
+        is_mono = font_or_tt.name == "tt" or any(kw in face for kw in ["monospace", "courier", "consolas"])
+        if is_mono:
+            text = font_or_tt.get_text()
+            if len(text.splitlines()) >= 2 or len(text.strip()) > 80:
+                lang = detect_lang([], text)
+                font_or_tt.string = f"\n```{lang}\n{text.strip()}\n```\n"
 
 
 class EpubBook:
@@ -128,20 +176,19 @@ class EpubBook:
 
     def _read_file_text(self, internal_path: str, encoding: str = "utf-8") -> str:
         """从 zip 中读取文本文件内容"""
-        # 规整路径（处理 Windows 反斜杠）
         norm_path = internal_path.replace("\\", "/").lstrip("/")
         try:
             raw = self.zip_file.read(norm_path)
             return raw.decode(encoding, errors="replace")
         except KeyError:
-            # 尝试不区分大小写匹配
             for name in self.zip_file.namelist():
                 if name.lower() == norm_path.lower():
-                    return self.zip_file.read(name).decode(encoding, errors="replace")
-            raise FileNotFoundError(f"File '{internal_path}' not found in EPUB archive.")
+                    raw = self.zip_file.read(name)
+                    return raw.decode(encoding, errors="replace")
+            raise FileNotFoundError(f"Path '{internal_path}' not found in EPUB archive.")
 
     def _read_file_bytes(self, internal_path: str) -> bytes:
-        """从 zip 中读取二进制数据"""
+        """从 zip 中读取二进制内容"""
         norm_path = internal_path.replace("\\", "/").lstrip("/")
         try:
             return self.zip_file.read(norm_path)
@@ -149,197 +196,190 @@ class EpubBook:
             for name in self.zip_file.namelist():
                 if name.lower() == norm_path.lower():
                     return self.zip_file.read(name)
-            raise FileNotFoundError(f"File '{internal_path}' not found in EPUB archive.")
+            raise FileNotFoundError(f"Path '{internal_path}' not found in EPUB archive.")
 
     def _find_opf_path(self) -> str:
         """从 META-INF/container.xml 定位 content.opf 路径"""
-        try:
-            container_xml = self._read_file_text("META-INF/container.xml")
-            root = ET.fromstring(container_xml)
-            # 查找 rootfile
-            for elem in root.iter():
-                if _strip_ns(elem.tag) == "rootfile":
-                    full_path = elem.attrib.get("full-path")
-                    if full_path:
-                        return full_path
-        except Exception:
-            pass
+        container_xml = self._read_file_text("META-INF/container.xml")
+        root = ET.fromstring(container_xml)
+        for elem in root.findall(".//{urn:oasis:names:tc:opendocument:xmlns:container}rootfile"):
+            full_path = elem.get("full-path")
+            if full_path:
+                return full_path
+        for elem in root.findall(".//rootfile"):
+            full_path = elem.get("full-path")
+            if full_path:
+                return full_path
+        raise ValueError("Could not find rootfile in META-INF/container.xml")
 
-        # 兜底查找 .opf 文件
-        for name in self.zip_file.namelist():
-            if name.lower().endswith(".opf"):
-                return name
-
-        raise ValueError("Cannot locate .opf package file in EPUB.")
-
-    def _parse_opf(self) -> Tuple[Dict[str, Any], Dict[str, Dict[str, str]], List[str]]:
-        """解析 content.opf 获取元数据、资源清单与阅读顺序 spine"""
+    def _parse_opf(self) -> Tuple[Dict[str, str], Dict[str, Dict[str, str]], List[str]]:
+        """解析 OPF 文件元数据、Manifest 和 Spine"""
         opf_xml = self._read_file_text(self.opf_path)
         root = ET.fromstring(opf_xml)
 
-        metadata = {"title": "", "author": "", "language": "", "identifier": "", "description": ""}
+        metadata = {}
         manifest = {}
         spine = []
 
-        for elem in root.iter():
-            tag = _strip_ns(elem.tag)
-            if tag == "title" and not metadata["title"]:
-                metadata["title"] = (elem.text or "").strip()
-            elif tag in ("creator", "author") and not metadata["author"]:
-                metadata["author"] = (elem.text or "").strip()
-            elif tag == "language" and not metadata["language"]:
-                metadata["language"] = (elem.text or "").strip()
-            elif tag == "identifier" and not metadata["identifier"]:
-                metadata["identifier"] = (elem.text or "").strip()
-            elif tag == "description" and not metadata["description"]:
-                metadata["description"] = (elem.text or "").strip()
-            elif tag == "item":
-                item_id = elem.attrib.get("id")
-                href = elem.attrib.get("href", "")
-                media_type = elem.attrib.get("media-type", "")
-                properties = elem.attrib.get("properties", "")
-                if item_id and href:
-                    # 转换相对 opf 的路径为 zip 内部全路径
-                    if self.opf_dir:
-                        full_href = f"{self.opf_dir}/{href}".replace("\\", "/")
-                    else:
-                        full_href = href.replace("\\", "/")
-                    # 规整化路径中的 ../ 和 ./
-                    full_href = os.path.normpath(full_href).replace("\\", "/")
-                    manifest[item_id] = {
-                        "href": href,
-                        "full_path": full_href,
-                        "media-type": media_type,
-                        "properties": properties,
-                    }
-            elif tag == "itemref":
-                idref = elem.attrib.get("idref")
-                if idref:
-                    spine.append(idref)
+        for child in root:
+            tag = _strip_ns(child.tag).lower()
+            if tag == "metadata":
+                for m in child:
+                    mtag = _strip_ns(m.tag).lower()
+                    if mtag == "title":
+                        metadata["title"] = (m.text or "").strip()
+                    elif mtag == "creator":
+                        metadata["author"] = (m.text or "").strip()
+                    elif mtag == "language":
+                        metadata["language"] = (m.text or "").strip()
+                    elif mtag == "identifier":
+                        metadata["identifier"] = (m.text or "").strip()
+                    elif mtag == "publisher":
+                        metadata["publisher"] = (m.text or "").strip()
+            elif tag == "manifest":
+                for item in child:
+                    item_id = item.get("id")
+                    href = item.get("href")
+                    media_type = item.get("media-type")
+                    properties = item.get("properties", "")
+                    if item_id and href:
+                        href_unquoted = unquote(href)
+                        if self.opf_dir:
+                            full_path = os.path.normpath(f"{self.opf_dir}/{href_unquoted}").replace("\\", "/")
+                        else:
+                            full_path = os.path.normpath(href_unquoted).replace("\\", "/")
+                        manifest[item_id] = {
+                            "id": item_id,
+                            "href": href_unquoted,
+                            "full_path": full_path,
+                            "media_type": media_type,
+                            "properties": properties,
+                        }
+            elif tag == "spine":
+                self.spine_toc_id = child.get("toc")
+                for itemref in child:
+                    idref = itemref.get("idref")
+                    if idref:
+                        spine.append(idref)
 
         return metadata, manifest, spine
 
     def _parse_toc(self) -> List[Dict[str, Any]]:
-        """提取 TOC 目录，优先解析 toc.ncx (EPUB2) 或 nav.xhtml (EPUB3)，兜底使用 spine"""
-        toc = []
-
-        # 1. 尝试查找 toc.ncx
-        ncx_path = None
-        for item_id, item in self.manifest.items():
-            if item.get("media-type") == "application/x-dtbncx+xml" or item.get("href", "").lower().endswith(".ncx"):
-                ncx_path = item["full_path"]
+        """提取 TOC 目录，优先 EPUB 3 (nav.xhtml)，其次 EPUB 2 (toc.ncx)，最后 Spine 兜底"""
+        nav_item = None
+        for item in self.manifest.values():
+            if "nav" in item.get("properties", "").split():
+                nav_item = item
                 break
 
-        if ncx_path:
+        if nav_item:
             try:
-                toc = self._parse_ncx(ncx_path)
+                toc = self._parse_nav_xhtml(nav_item["full_path"])
+                if toc:
+                    for i, t in enumerate(toc):
+                        t["index"] = i + 1
+                    return toc
             except Exception:
-                toc = []
+                pass
 
-        # 2. 如果 NCX 为空，尝试 EPUB 3 nav.xhtml
-        if not toc:
-            nav_path = None
-            for item_id, item in self.manifest.items():
-                props = item.get("properties", "")
-                if "nav" in props.split() or item.get("href", "").lower().endswith("nav.xhtml"):
-                    nav_path = item["full_path"]
+        ncx_item = None
+        if hasattr(self, "spine_toc_id") and self.spine_toc_id:
+            ncx_item = self.manifest.get(self.spine_toc_id)
+
+        if not ncx_item:
+            for item in self.manifest.values():
+                if item.get("media_type") == "application/x-dtbncx+xml" or item["href"].lower().endswith(".ncx"):
+                    ncx_item = item
                     break
 
-            if nav_path:
-                try:
-                    toc = self._parse_nav_xhtml(nav_path)
-                except Exception:
-                    toc = []
+        if ncx_item:
+            try:
+                toc = self._parse_toc_ncx(ncx_item["full_path"])
+                if toc:
+                    for i, t in enumerate(toc):
+                        t["index"] = i + 1
+                    return toc
+            except Exception:
+                pass
 
-        # 3. 兜底策略：使用 spine 列表构建基础目录
-        if not toc and self.spine:
-            toc = self._build_toc_from_spine()
-
-        # 为所有目录项统一编号并规整
-        for i, item in enumerate(toc):
-            item["index"] = i + 1
-            if "level" not in item:
-                item["level"] = 1
-
+        toc = self._build_toc_from_spine()
+        for i, t in enumerate(toc):
+            t["index"] = i + 1
         return toc
 
-    def _parse_ncx(self, ncx_path: str) -> List[Dict[str, Any]]:
-        """解析 EPUB 2 NCX 目录"""
+    def _parse_toc_ncx(self, ncx_path: str) -> List[Dict[str, Any]]:
+        """解析 toc.ncx XML"""
         ncx_xml = self._read_file_text(ncx_path)
         root = ET.fromstring(ncx_xml)
         ncx_dir = os.path.dirname(ncx_path)
-
         toc = []
 
-        def parse_nav_points(element, current_level=1):
-            for child in element:
-                if _strip_ns(child.tag) == "navPoint":
-                    label_text = ""
-                    content_src = ""
-                    for sub in child:
-                        sub_tag = _strip_ns(sub.tag)
-                        if sub_tag == "navLabel":
-                            for t in sub:
-                                if _strip_ns(t.tag) == "text":
-                                    label_text = (t.text or "").strip()
-                        elif sub_tag == "content":
-                            content_src = sub.attrib.get("src", "")
+        def parse_navpoint(elem, level=1):
+            title = ""
+            for lbl in elem.findall("{http://www.daisy.org/z3986/2005/ncx/}navLabel") or elem.findall("navLabel"):
+                txt = lbl.find("{http://www.daisy.org/z3986/2005/ncx/}text") or lbl.find("text")
+                if txt is not None and txt.text:
+                    title = txt.text.strip()
+                    break
 
-                    if label_text and content_src:
-                        # 解析 href 与 锚点
-                        src_clean, anchor = urldefrag(content_src)
-                        if ncx_dir:
-                            full_path = os.path.normpath(f"{ncx_dir}/{src_clean}").replace("\\", "/")
-                        else:
-                            full_path = os.path.normpath(src_clean).replace("\\", "/")
+            src = ""
+            for cnt in elem.findall("{http://www.daisy.org/z3986/2005/ncx/}content") or elem.findall("content"):
+                src = cnt.get("src", "")
+                if src:
+                    break
 
-                        toc.append({
-                            "title": label_text,
-                            "level": current_level,
-                            "src": content_src,
-                            "file_path": full_path,
-                            "anchor": anchor or None,
-                        })
+            if title and src:
+                src_unquoted = unquote(src)
+                src_clean, anchor = urldefrag(src_unquoted)
+                if ncx_dir:
+                    full_path = os.path.normpath(f"{ncx_dir}/{src_clean}").replace("\\", "/")
+                else:
+                    full_path = os.path.normpath(src_clean).replace("\\", "/")
 
-                    # 递归解析子章节
-                    parse_nav_points(child, current_level + 1)
+                toc.append({
+                    "title": title,
+                    "level": level,
+                    "src": src_unquoted,
+                    "file_path": full_path,
+                    "anchor": anchor or None,
+                })
 
-        # 寻找 navMap
-        nav_map = None
-        for elem in root.iter():
-            if _strip_ns(elem.tag) == "navMap":
-                nav_map = elem
-                break
+            for child in elem.findall("{http://www.daisy.org/z3986/2005/ncx/}navPoint") or elem.findall("navPoint"):
+                parse_navpoint(child, level + 1)
+
+        nav_map = root.find("{http://www.daisy.org/z3986/2005/ncx/}navMap")
+        if nav_map is None:
+            nav_map = root.find("navMap")
 
         if nav_map is not None:
-            parse_nav_points(nav_map, 1)
+            for np in nav_map.findall("{http://www.daisy.org/z3986/2005/ncx/}navPoint") or nav_map.findall("navPoint"):
+                parse_navpoint(np, 1)
 
         return toc
 
     def _parse_nav_xhtml(self, nav_path: str) -> List[Dict[str, Any]]:
-        """解析 EPUB 3 nav.xhtml 目录"""
+        """解析 EPUB 3 的 nav.xhtml"""
         nav_html = self._read_file_text(nav_path)
         nav_dir = os.path.dirname(nav_path)
         toc = []
 
         if BeautifulSoup:
             soup = BeautifulSoup(nav_html, "html.parser")
-            nav_elem = soup.find("nav", attrs={"epub:type": "toc"}) or soup.find("nav", id="toc") or soup.find("nav")
+            nav_elem = soup.find("nav", attrs={"epub:type": "toc"}) or soup.find("nav")
             if not nav_elem:
                 return []
 
-            def parse_ol(ol_node, current_level=1):
-                for li in ol_node.find_all("li", recursive=False):
-                    a_tag = li.find("a", recursive=False)
-                    if a_tag and a_tag.get("href"):
-                        href = a_tag.get("href", "")
-                        title = a_tag.get_text().strip()
+            def parse_ol(ol_tag, current_level=1):
+                for li in ol_tag.find_all("li", recursive=False):
+                    a = li.find("a", recursive=False)
+                    if a and a.get("href"):
+                        href = unquote(a["href"].strip())
+                        title = a.get_text().strip()
                         src_clean, anchor = urldefrag(href)
                         if nav_dir:
                             full_path = os.path.normpath(f"{nav_dir}/{src_clean}").replace("\\", "/")
                         else:
                             full_path = os.path.normpath(src_clean).replace("\\", "/")
-
                         toc.append({
                             "title": title,
                             "level": current_level,
@@ -356,7 +396,6 @@ class EpubBook:
             if top_ol:
                 parse_ol(top_ol, 1)
         else:
-            # 轻量正则抽取
             matches = re.findall(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', nav_html, re.DOTALL | re.IGNORECASE)
             for href, raw_text in matches:
                 clean_text = re.sub(r"<[^>]+>", "", raw_text).strip()
@@ -384,7 +423,6 @@ class EpubBook:
             if not item:
                 continue
             full_path = item["full_path"]
-            # 尝试读取该页面的 <title> 或 <h1> 作为标题
             title = idref
             try:
                 html_text = self._read_file_text(full_path)
@@ -437,11 +475,19 @@ class EpubBook:
 
         if query:
             q_lower = query.lower().strip()
-            # 1. 精确匹配
             for it in self.toc:
                 if it["title"].lower() == q_lower:
                     return it
-            # 2. 包含匹配
+            pattern = r'(?:^|[\s第])' + re.escape(q_lower) + r'(?:[\s.、:：章节]|$)'
+            for it in self.toc:
+                t_lower = it["title"].lower()
+                if re.search(pattern, t_lower) or t_lower.startswith(q_lower):
+                    return it
+            q_norm = re.sub(r'[\s\-_.:：·]+', '', q_lower)
+            for it in self.toc:
+                t_norm = re.sub(r'[\s\-_.:：·]+', '', it["title"].lower())
+                if q_norm in t_norm:
+                    return it
             for it in self.toc:
                 if q_lower in it["title"].lower():
                     return it
@@ -457,57 +503,49 @@ class EpubBook:
         if not anchor or not BeautifulSoup:
             return full_html
 
-        # 若指定了锚点，尝试提取锚点所在的元素及其内容
         soup = BeautifulSoup(full_html, "html.parser")
         target_elem = soup.find(id=anchor) or soup.find(attrs={"name": anchor})
         if target_elem:
-            # 如果是 section/div/article 等容器标签，提取自身
             if target_elem.name in ("section", "div", "article", "chapter"):
                 return str(target_elem)
-            # 否则返回整页内容（保留上下文）
             return full_html
 
         return full_html
 
     def extract_chapter_images(self, chapter_info: Dict[str, Any], output_dir: Optional[str] = None) -> List[Dict[str, Any]]:
-        """提取目标章节涉及的所有插图资源"""
+        """提取目标章节关联的所有图片"""
         file_path = chapter_info["file_path"]
-        chapter_dir = os.path.dirname(file_path)
-        raw_html = self.extract_chapter_html(chapter_info)
+        ch_dir = os.path.dirname(file_path)
+        full_html = self._read_file_text(file_path)
 
-        extracted_images = []
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
+        extracted = []
         if BeautifulSoup:
-            soup = BeautifulSoup(raw_html, "html.parser")
-            img_tags = soup.find_all(["img", "image"])
+            soup = BeautifulSoup(full_html, "html.parser")
+            imgs = soup.find_all(["img", "image"])
         else:
-            img_tags = []
-            for src in re.findall(r'<img[^>]+src=[\"\']([^\"\']+)[\"\']', raw_html, re.I):
-                img_tags.append({"src": src, "alt": ""})
+            imgs = []
+            for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', full_html, re.I):
+                imgs.append({"src": m.group(1), "alt": ""})
 
-        seen_paths = set()
-        for idx, tag in enumerate(img_tags):
-            if hasattr(tag, "get"):
-                src = tag.get("src") or tag.get("xlink:href") or tag.get("href")
-                alt = tag.get("alt", "")
+        for i, img_tag in enumerate(imgs):
+            if hasattr(img_tag, "get"):
+                src = img_tag.get("src") or img_tag.get("xlink:href")
+                alt = img_tag.get("alt", "")
             else:
-                src = tag.get("src")
-                alt = tag.get("alt", "")
+                src = img_tag["src"]
+                alt = img_tag.get("alt", "")
 
             if not src:
                 continue
 
-            src_clean, _ = urldefrag(unquote(src))
-            if chapter_dir:
-                internal_img_path = os.path.normpath(f"{chapter_dir}/{src_clean}").replace("\\", "/")
+            src_clean = unquote(src).split("?")[0].split("#")[0]
+            if ch_dir:
+                internal_img_path = os.path.normpath(f"{ch_dir}/{src_clean}").replace("\\", "/")
             else:
                 internal_img_path = os.path.normpath(src_clean).replace("\\", "/")
-
-            if internal_img_path in seen_paths:
-                continue
-            seen_paths.add(internal_img_path)
 
             try:
                 img_bytes = self._read_file_bytes(internal_img_path)
@@ -516,60 +554,60 @@ class EpubBook:
 
             saved_path = None
             if output_dir:
-                ext = os.path.splitext(internal_img_path)[1] or detect_image_ext(img_bytes)
-                ch_idx = chapter_info.get("index", 1)
-                img_filename = f"ch{ch_idx:03d}_img{idx + 1:03d}{ext}"
+                ext = os.path.splitext(internal_img_path)[1]
+                if not ext:
+                    ext = detect_image_ext(img_bytes)
+                ch_num = chapter_info.get("index", 1)
+                img_filename = f"ch{ch_num:03d}_img{i + 1:03d}{ext}"
                 saved_path = os.path.join(output_dir, img_filename)
                 with open(saved_path, "wb") as f:
                     f.write(img_bytes)
 
-            extracted_images.append({
-                "src": src,
+            extracted.append({
+                "index": i + 1,
                 "internal_path": internal_img_path,
-                "bytes": img_bytes,
                 "saved_path": saved_path,
                 "alt": alt,
+                "bytes": img_bytes,
             })
 
-        return extracted_images
+        return extracted
 
-    def extract_chapter_markdown(self, chapter_info: Dict[str, Any], dump_images_dir: Optional[str] = None, ocr: bool = False, ocr_engine: Optional[str] = None) -> str:
-        """提取目标章节并转换为高质量结构化 Markdown（支持插图导出与 OCR 智能回填）"""
-        raw_html = self.extract_chapter_html(chapter_info)
-        title = chapter_info.get("title", "")
+    def extract_chapter_markdown(
+        self,
+        chapter_info: Dict[str, Any],
+        dump_images_dir: Optional[str] = None,
+        ocr: bool = False,
+        ocr_engine: Optional[str] = None,
+    ) -> str:
+        """提取目标章节并转换为 Markdown (支持插图导出与 OCR 智能回填)"""
+        html_content = self.extract_chapter_html(chapter_info)
         file_path = chapter_info["file_path"]
-        chapter_dir = os.path.dirname(file_path)
+        ch_dir = os.path.dirname(file_path)
+        title = chapter_info.get("title", "")
 
         if dump_images_dir:
             os.makedirs(dump_images_dir, exist_ok=True)
 
         placeholders = {}
-        processed_html = raw_html
+        processed_html = html_content
 
         if BeautifulSoup:
-            soup = BeautifulSoup(raw_html, "html.parser")
-            # 1. 净化冗余导航与页眉页脚
+            soup = BeautifulSoup(html_content, "html.parser")
             purge_useless_navigation(soup)
-            # 2. 将 MathML 数学公式转换为标准 LaTeX
             convert_soup_mathml_to_latex(soup)
-            # 3. 增强原生代码块
             enhance_pre_code_tags(soup)
 
-            img_tags = soup.find_all(["img", "image"])
-            for idx, tag in enumerate(img_tags):
-                src = tag.get("src") or tag.get("xlink:href") or tag.get("href")
-                alt_raw = tag.get("alt", "").strip()
-                if alt_raw:
-                    clean_name = os.path.basename(alt_raw.replace("\\", "/"))
-                    alt = clean_name if clean_name else f"插图 {idx + 1}"
-                else:
-                    alt = f"插图 {idx + 1}"
+            imgs = soup.find_all(["img", "image"])
+            for i, img in enumerate(imgs):
+                src = img.get("src") or img.get("xlink:href")
+                alt = img.get("alt", "").strip()
                 if not src:
                     continue
 
-                src_clean, _ = urldefrag(unquote(src))
-                if chapter_dir:
-                    internal_img_path = os.path.normpath(f"{chapter_dir}/{src_clean}").replace("\\", "/")
+                src_clean = unquote(src).split("?")[0].split("#")[0]
+                if ch_dir:
+                    internal_img_path = os.path.normpath(f"{ch_dir}/{src_clean}").replace("\\", "/")
                 else:
                     internal_img_path = os.path.normpath(src_clean).replace("\\", "/")
 
@@ -580,61 +618,56 @@ class EpubBook:
 
                 saved_path = None
                 if dump_images_dir:
-                    ext = os.path.splitext(internal_img_path)[1] or detect_image_ext(img_bytes)
-                    ch_idx = chapter_info.get("index", 1)
-                    img_filename = f"ch{ch_idx:03d}_img{idx + 1:03d}{ext}"
+                    ext = os.path.splitext(internal_img_path)[1]
+                    if not ext:
+                        ext = detect_image_ext(img_bytes)
+                    ch_num = chapter_info.get("index", 1)
+                    img_filename = f"ch{ch_num:03d}_img{i + 1:03d}{ext}"
                     saved_path = os.path.join(dump_images_dir, img_filename)
                     with open(saved_path, "wb") as f:
                         f.write(img_bytes)
 
                 if ocr:
                     ocr_text = ocr_image(img_bytes, engine_name=ocr_engine)
-                    ph_key = f"__EPUB_OCR_PLACEHOLDER_{idx}__"
-                    placeholders[ph_key] = format_ocr_markdown(ocr_text, alt_text=alt, image_rel_path=saved_path)
+                    ph_key = f"__EPUB_OCR_PLACEHOLDER_{i}__"
+                    placeholders[ph_key] = format_ocr_markdown(ocr_text, alt_text=alt or f"插图 {i + 1}", image_rel_path=saved_path)
                     p_tag = soup.new_tag("p")
                     p_tag.string = ph_key
-                    tag.replace_with(p_tag)
+                    img.replace_with(p_tag)
                 elif saved_path:
-                    # 更新 img 标签指向导出的本地相对路径
-                    tag["src"] = saved_path
+                    if img.name == "image":
+                        img["xlink:href"] = saved_path
+                    else:
+                        img["src"] = saved_path
 
             processed_html = str(soup)
 
-        # 优先使用 html2text 或 markdownify
         if html2text:
             h = html2text.HTML2Text()
-            h.ignore_links = False
-            h.ignore_images = False
-            h.body_width = 0  # 不强制自动折行
-            h.protect_links = True
+            h.body_width = 0
             h.unicode_snob = True
+            h.ignore_images = False
             md = h.handle(processed_html).strip()
         elif markdownify:
-            md = markdownify.markdownify(processed_html, heading_style="ATX", strip=['script', 'style']).strip()
+            md = markdownify.markdownify(processed_html, heading_style="ATX").strip()
         elif BeautifulSoup:
             soup = BeautifulSoup(processed_html, "html.parser")
-            for tag in soup(["script", "style", "nav"]):
-                tag.decompose()
             md = soup.get_text(separator="\n\n").strip()
         else:
-            clean = re.sub(r"<[^>]+>", "", processed_html)
-            md = clean.strip()
+            md = re.sub(r"<[^>]+>", "", processed_html).strip()
 
-        # 还原 OCR 占位符
         for ph_key, block in placeholders.items():
             md = md.replace(ph_key, block)
 
-        # 确保首行包含大标题（如果转换结果未包含）
         if title and not md.startswith("# "):
             md = f"# {title}\n\n{md}"
 
         return md
 
 
-
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python epub_parser.py <path_to_epub> [--probe] [--list] [--extract <query/index>]")
+        print("Usage: python epub_parser.py <path_to_epub> [--probe] [--list]")
         sys.exit(1)
 
     epub_path = sys.argv[1]
@@ -642,12 +675,11 @@ def main():
         if "--probe" in sys.argv:
             print(json.dumps(book.get_probe_info(), ensure_ascii=False, indent=2))
         elif "--list" in sys.argv:
-            print(f"Total chapters: {len(book.toc)}")
             for item in book.toc:
                 indent = "  " * (item["level"] - 1)
-                print(f"[{item['index']:03d}] {indent}{item['title']} -> {item['src']}")
+                print(f"[{item['index']:02d}] {indent}{item['title']} -> {item['file_path']}")
         else:
-            print(json.dumps(book.get_probe_info(), ensure_ascii=False, indent=2))
+            print(f"EPUB Book: {book.metadata.get('title')}, TOC Chapters: {len(book.toc)}")
 
 
 if __name__ == "__main__":

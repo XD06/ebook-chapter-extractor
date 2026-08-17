@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from env_checker import ensure_core_dependencies
 ensure_core_dependencies()
+from ocr_helper import get_cache_dir
 
 try:
     import pymupdf
@@ -242,9 +243,8 @@ def main():
 
     # 确定输出路径
     if not args.output:
-        base_dir = os.path.dirname(file_path)
         stem = os.path.splitext(os.path.basename(file_path))[0]
-        cache_dir = os.path.join(base_dir, ".cache")
+        cache_dir = get_cache_dir(file_path)
         os.makedirs(cache_dir, exist_ok=True)
         args.output = os.path.join(cache_dir, f"{stem}_chapters.json")
 

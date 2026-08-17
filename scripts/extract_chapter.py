@@ -2,11 +2,14 @@
 """
 extract_chapter.py - 电子书按需章节提取与切片工具 (支持 PDF / EPUB / MOBI / AZW3)
 - PDF: 支持按章节标题或物理页范围提取为纯文本、Markdown、独立子 PDF 切片或渲染高清图像；
-- EPUB / MOBI / AZW3: 支持按章节标题或序号提取为结构化 Markdown、纯文本或原始 HTML。
+       遇扫描版/无文本层 PDF 时，自动智能降级至高清渲染 + 本地 OCR 双通道输出 (视觉直读原图 + 离线文本兜底)；
+- EPUB / MOBI / AZW3: 支持按章节标题或序号提取为结构化 Markdown、纯文本或原始 HTML，
+       支持代码块智能识别与插图 RapidOCR 回填。
 """
 
 import sys
 import os
+import re
 import argparse
 import tempfile
 import json
@@ -14,6 +17,7 @@ import json
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from env_checker import ensure_core_dependencies, ensure_ocr_dependencies
+from ocr_helper import get_cache_dir, ocr_image, clean_ocr_text, clean_code_ocr
 ensure_core_dependencies()
 
 try:
@@ -26,11 +30,11 @@ except ImportError:
 
 
 # ==============================================================================
-# PDF 提取实现部分 (完全保持原有行为)
+# PDF 提取实现部分
 # ==============================================================================
 
 def find_pdf_chapter_range(doc, chapter_query: str) -> tuple:
-    """PDF 专用：在书签中查找匹配章节的物理起止页"""
+    """PDF 专用：在书签中查找匹配章节的物理起止页（支持前缀、数字、模糊匹配与书签自愈）"""
     raw_toc = doc.get_toc()
     if not raw_toc:
         return None, None, None
@@ -51,12 +55,43 @@ def find_pdf_chapter_range(doc, chapter_query: str) -> tuple:
                     cleaned[i]["phys"] = cleaned[j]["phys"]
                     break
 
+    q = chapter_query.strip()
+    q_lower = q.lower()
+    q_norm = re.sub(r'[\s\-_.:：·]+', '', q_lower)
+
     matched_idx = -1
-    query_lower = chapter_query.lower()
+
+    # 1. 严格全等匹配
     for i, it in enumerate(cleaned):
-        if query_lower in it["title"].lower() and it["phys"] > 0:
+        if it["phys"] > 0 and it["title"].strip().lower() == q_lower:
             matched_idx = i
             break
+
+    # 2. 章节号前缀/边界匹配 (e.g. "2.3.2" 匹配 "2.3.2 指针" 或 "第2章" 匹配 "第2章 程序结构")
+    if matched_idx == -1:
+        pattern = r'(?:^|[\s第])' + re.escape(q_lower) + r'(?:[\s.、:：章节]|$)'
+        for i, it in enumerate(cleaned):
+            if it["phys"] > 0:
+                t_lower = it["title"].lower()
+                if re.search(pattern, t_lower) or t_lower.startswith(q_lower):
+                    matched_idx = i
+                    break
+
+    # 3. 归一化子串匹配
+    if matched_idx == -1:
+        for i, it in enumerate(cleaned):
+            if it["phys"] > 0:
+                t_norm = re.sub(r'[\s\-_.:：·]+', '', it["title"].lower())
+                if q_norm in t_norm:
+                    matched_idx = i
+                    break
+
+    # 4. 普通子串包含匹配
+    if matched_idx == -1:
+        for i, it in enumerate(cleaned):
+            if it["phys"] > 0 and q_lower in it["title"].lower():
+                matched_idx = i
+                break
 
     if matched_idx == -1:
         return None, None, None
@@ -130,7 +165,7 @@ def extract_pdf_as_markdown(doc, start_phys: int, end_phys: int, output_md: str 
 
 
 def handle_pdf_extraction(args, pdf_path: str):
-    """处理 PDF 提取"""
+    """处理 PDF 提取，包含扫描件自动降级与双通道输出机制"""
     if pymupdf is None:
         print("Error: PyMuPDF is required. Run: pip install pymupdf")
         sys.exit(1)
@@ -155,35 +190,136 @@ def handle_pdf_extraction(args, pdf_path: str):
     page_count = end_p - start_p + 1
     print(f"[*] Target: {ch_title} | Physical Pages: {start_p} to {end_p} ({page_count} pages)", file=sys.stderr)
 
-    # Sanity Check
+    # 嗅探目标页面是否为纯扫描/图像版（无内置文字层）
+    raw_page_texts = [doc[pno].get_text().strip() for pno in range(start_p - 1, end_p)]
+    total_chars = sum(len(t) for t in raw_page_texts)
+    is_scanned = (total_chars < 30 * page_count) or args.ocr
+
+    # 1. 显式指定切片为子 PDF
+    if args.format == "pdf":
+        out_path = args.output or f"{ch_title.replace(':', '_')}.pdf"
+        slice_sub_pdf(doc, start_p, end_p, out_path)
+        print(f"Sliced PDF saved to: {out_path} ({os.path.getsize(out_path)} bytes)")
+        return
+
+    # 2. 显式指定渲染图像
+    if args.format == "image":
+        pdf_stem = os.path.splitext(os.path.basename(pdf_path))[0]
+        out_dir = args.output or get_cache_dir(pdf_path, f"{pdf_stem}_images")
+        imgs = render_images(doc, start_p, end_p, out_dir, args.dpi)
+        print(f"Rendered {len(imgs)} pages to: {out_dir}")
+        return
+
+    # 3. 扫描版 PDF 智能降级与双通道输出 (Dual-Channel Output)
+    if is_scanned:
+        if args.ocr:
+            ensure_ocr_dependencies()
+        pdf_stem = os.path.splitext(os.path.basename(pdf_path))[0]
+        out_dir = get_cache_dir(pdf_path, f"{pdf_stem}_images")
+        imgs = render_images(doc, start_p, end_p, out_dir, args.dpi)
+        print(f"[*] Scanned PDF detected ({total_chars} chars extracted). Rendered {len(imgs)} pages for Agent Vision.", file=sys.stderr)
+
+        # 运行 OCR 文本识别
+        ocr_blocks = []
+        for i, img_p in enumerate(imgs):
+            phys_num = start_p + i
+            ocr_res = ocr_image(img_p, engine_name=args.ocr_engine)
+            cleaned_res = clean_ocr_text(ocr_res)
+            ocr_blocks.append(f"<!-- Page {phys_num} -->\n{cleaned_res}")
+
+        ocr_full_text = "\n\n".join(ocr_blocks)
+
+        # 构建双通道 Markdown 内容
+        img_bullet_list = "\n".join([f"- Page {start_p + i}: `{img_path}`" for i, img_path in enumerate(imgs)])
+        dual_channel_md = f"""# {ch_title}
+
+> 💡 **Agent 视觉直读模式**：本章节为扫描件/图层版，已自动切片渲染为高清图像。推荐 Agent 多模态视觉模型直接阅读下列图片以获得 100% 精确排版、代码与公式；下方同时附带离线 OCR 文本作为快速参考通道。
+
+### 🖼️ 高清视觉渲染切片（共 {len(imgs)} 页）
+{img_bullet_list}
+
+---
+
+### 📝 离线 OCR 提取文本通道
+{ocr_full_text}
+"""
+        final_content = dual_channel_md if args.format == "md" else ocr_full_text
+
+        if getattr(args, "json", False):
+            result = {
+                "success": True,
+                "file": pdf_path,
+                "title": ch_title,
+                "start_phys": start_p,
+                "end_phys": end_p,
+                "page_count": page_count,
+                "format": args.format,
+                "is_scanned": True,
+                "images_dumped": imgs,
+                "content": final_content,
+                "stats": {
+                    "char_count": len(final_content),
+                    "line_count": len(final_content.splitlines()),
+                    "image_count": len(imgs),
+                }
+            }
+            if args.output:
+                with open(args.output, "w", encoding="utf-8") as f:
+                    json.dump(result, f, ensure_ascii=False, indent=2)
+                print(f"Saved JSON to: {args.output}")
+            else:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            return
+
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(final_content)
+            print(f"Saved dual-channel extraction to: {args.output}")
+        else:
+            print(final_content)
+        return
+
+    # 4. 正常数字版 PDF 文本/Markdown 提取
     first_lines = [l.strip() for l in doc[start_p - 1].get_text().splitlines() if l.strip()][:3]
     print(f"[*] Sanity Check (Page {start_p} first lines): {first_lines}", file=sys.stderr)
 
     if args.format == "text":
-        txt = extract_pdf_as_text(doc, start_p, end_p)
+        content = extract_pdf_as_text(doc, start_p, end_p)
+    else:  # md
+        content = extract_pdf_as_markdown(doc, start_p, end_p, args.output)
+
+    if getattr(args, "json", False):
+        result = {
+            "success": True,
+            "file": pdf_path,
+            "title": ch_title,
+            "start_phys": start_p,
+            "end_phys": end_p,
+            "page_count": page_count,
+            "format": args.format,
+            "is_scanned": False,
+            "images_dumped": [],
+            "content": content,
+            "stats": {
+                "char_count": len(content),
+                "line_count": len(content.splitlines()),
+                "image_count": 0,
+            }
+        }
         if args.output:
             with open(args.output, "w", encoding="utf-8") as f:
-                f.write(txt)
-            print(f"Saved text to: {args.output}")
+                json.dump(result, f, ensure_ascii=False, indent=2)
+            print(f"Saved JSON to: {args.output}")
         else:
-            print(txt)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
 
-    elif args.format == "md":
-        md = extract_pdf_as_markdown(doc, start_p, end_p, args.output)
-        if not args.output:
-            print(md)
-        else:
-            print(f"Saved Markdown to: {args.output}")
-
-    elif args.format == "pdf":
-        out_path = args.output or f"{ch_title.replace(':', '_')}.pdf"
-        slice_sub_pdf(doc, start_p, end_p, out_path)
-        print(f"Sliced PDF saved to: {out_path} ({os.path.getsize(out_path)} bytes)")
-
-    elif args.format == "image":
-        out_dir = args.output or os.path.join(os.path.dirname(pdf_path), ".cache", f"{ch_title}_images")
-        imgs = render_images(doc, start_p, end_p, out_dir, args.dpi)
-        print(f"Rendered {len(imgs)} pages to: {out_dir}")
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"Saved to: {args.output}")
+    else:
+        print(content)
 
 
 # ==============================================================================
@@ -202,20 +338,15 @@ def handle_ebook_extraction(args, file_path: str, ext: str):
         from mobi_parser import MobiBook
         book_ctx = MobiBook(file_path)
 
-    # 智能原图导出逻辑：
-    # 1. 显式指定了 --dump-images：使用指定目录
-    # 2. 指定了 --ocr 且未禁用图片：默认同时自动导出原图到 .cache/images，确保 Markdown 中包含真实路径供 Agent 看图校对
+    # 智能原图导出逻辑
     dump_images_dir = None
     if args.dump_images:
         if args.dump_images is True or args.dump_images == "":
-            base_dir = os.path.dirname(args.output) if args.output else os.path.join(os.path.dirname(file_path), ".cache")
-            dump_images_dir = os.path.join(base_dir, "images")
+            dump_images_dir = get_cache_dir(file_path, "images")
         else:
             dump_images_dir = os.path.abspath(args.dump_images)
     elif args.ocr:
-        # 启用 OCR 时，默认自动释放原图至 .cache/images，以便 Markdown 附带真实路径供 Agent 校对
-        base_dir = os.path.dirname(args.output) if args.output else os.path.join(os.path.dirname(file_path), ".cache")
-        dump_images_dir = os.path.join(base_dir, "images")
+        dump_images_dir = get_cache_dir(file_path, "images")
 
     with book_ctx as book:
         ch_target = None
@@ -224,12 +355,10 @@ def handle_ebook_extraction(args, file_path: str, ext: str):
         elif args.chapter:
             ch_target = book.find_chapter(query=args.chapter)
         elif args.range:
-            # 支持传入序号范围，如 1-3
             try:
                 parts = args.range.split("-")
                 idx1 = int(parts[0])
                 idx2 = int(parts[1]) if len(parts) > 1 else idx1
-                # 聚合多章
                 md_chunks = []
                 for i in range(idx1, idx2 + 1):
                     item = book.find_chapter(index=i)
@@ -264,7 +393,6 @@ def handle_ebook_extraction(args, file_path: str, ext: str):
         if args.format == "html" and hasattr(book, "extract_chapter_html"):
             content = book.extract_chapter_html(ch_target)
         else:
-            # 默认或 md/text
             content = book.extract_chapter_markdown(
                 ch_target,
                 dump_images_dir=dump_images_dir,
@@ -272,7 +400,6 @@ def handle_ebook_extraction(args, file_path: str, ext: str):
                 ocr_engine=args.ocr_engine
             )
 
-        # 统计信息
         char_count = len(content)
         line_count = len(content.splitlines())
         dumped_imgs = []
@@ -317,17 +444,16 @@ def handle_ebook_extraction(args, file_path: str, ext: str):
             print(content)
 
 
-
 def main():
     parser = argparse.ArgumentParser(description="Extract eBook chapter on-demand (PDF/EPUB/MOBI/AZW3).")
     parser.add_argument("file_path", help="Path to eBook file (PDF, EPUB, MOBI, AZW3)")
-    parser.add_argument("--chapter", "-c", help="Chapter title keyword (e.g. 'Chapter 1', '第2章')")
+    parser.add_argument("--chapter", "-c", help="Chapter title keyword or number (e.g. '2.3.2', '8.2', 'Chapter 1')")
     parser.add_argument("--index", "-i", type=int, help="Chapter index number (1-based, mainly for EPUB/MOBI)")
     parser.add_argument("--range", "-r", help="Physical page range for PDF ('start-end') or chapter range for EPUB ('1-3')")
     parser.add_argument("--format", "-f", choices=["text", "md", "pdf", "image", "html"], default="md", help="Output format (default: md)")
     parser.add_argument("--output", "-o", help="Output file or directory path")
     parser.add_argument("--dpi", type=int, default=150, help="DPI for PDF image rendering")
-    parser.add_argument("--ocr", action="store_true", help="Enable OCR recognition for embedded images/code snippets into Markdown")
+    parser.add_argument("--ocr", action="store_true", help="Enable OCR recognition for embedded images / scanned PDF into Markdown")
     parser.add_argument("--dump-images", nargs="?", const=True, default=False, help="Dump embedded chapter images to folder (for Vision LLM reading)")
     parser.add_argument("--ocr-engine", choices=["rapidocr", "win_ocr", "pytesseract", "easyocr"], help="Specify OCR engine (default: auto detect)")
     parser.add_argument("--json", action="store_true", help="Output result as JSON object with metadata (Agent friendly)")
@@ -342,9 +468,6 @@ def main():
     if ext in (".epub", ".mobi", ".azw", ".azw3", ".prc"):
         handle_ebook_extraction(args, file_path, ext)
     else:
-        # 默认作为 PDF 提取
-        # 注意：PDF 默认格式若未指定，历史兼容默认是 text 还是 md？
-        # 这里如果用户显式指定就用用户指定的，未指定时若是 PDF，可继续兼顾
         handle_pdf_extraction(args, file_path)
 
 
