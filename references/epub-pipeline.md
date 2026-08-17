@@ -36,13 +36,16 @@ ebook.epub (ZIP 容器)
    - **EPUB 2**：解析 `toc.ncx` 中的 `<navPoint>` 节点；
    - **EPUB 3**：解析 `nav.xhtml` 中的 `<nav epub:type="toc">`；
    - **Spine 兜底**：若目录损坏，按 `<spine>` 中定义的线性阅读顺序解析每个文档的 `<title>` 或 `<h1>`。
-2. **章节内容转换**：
+2. **章节内容转换与代码块智能识别**：
    - 提取指定章节对应的 XHTML 片段；
+   - 预处理 `<pre>` / `<code>` 标签与等宽字体样式，规范化为标准 Markdown Fenced Code Blocks，防止换行折叠；
+   - 支持 MathML 标签递归转换为 LaTeX 行内/行间公式 (`$...$` / `$$...$$`)；
    - 使用 `html2text` 或 `markdownify` 转换为结构化 Markdown，保留原生表格与代码缩进。
 
 ---
 
-### 2.2 MOBI / AZW / AZW3 (KF8)
+## 3. MOBI / AZW / AZW3 (KF8)
+
 ```text
 book.mobi / book.azw3 (Palm Database 格式)
   ├─ PDB Header & Record List ───> 记录块定位
@@ -53,9 +56,12 @@ book.mobi / book.azw3 (Palm Database 格式)
       └─ Image Records ──────────> PDB 记录中提取二进制图片 (通过 recindex 映射)
 ```
 
+- **AZW3 (KF8)**：结构内嵌完整 EPUB 归档，直接采用 EPUB 解析流水线处理，目录抽取时支持粗体标题正则嗅探兜底；
+- **Mobi6**：采用纯 Python 原生实现的 LZ77 解压算法，零外部 C 拓展依赖，基于标题标签与锚点特征智能聚类断章。
+
 ---
 
-## 3. 插图与代码图处理流水线 (Vision vs OCR)
+## 4. 插图与代码图处理流水线 (Vision vs OCR)
 
 某些书籍制作时将代码、表格制作成了插图嵌入电子书中。流水线支持两种分流策略：
 
@@ -65,21 +71,21 @@ book.mobi / book.azw3 (Palm Database 格式)
                                └──> 策略 B: --ocr (调用 RapidOCR 识别图内文本与代码，格式化回填 Markdown)
 ```
 
-### 3.1 视觉大模型模式 (`--dump-images`)
+### 4.1 视觉大模型模式 (`--dump-images`)
 将该章节涉及的插图提取并保存在 `.cache/images/`，多模态 LLM 直接查看原图：
 ```bash
 python scripts/extract_chapter.py "book.mobi" --chapter "2.1 进入C++" --dump-images
 ```
 
-### 3.2 纯文字大模型模式 (`--ocr`)
-自动通过 `RapidOCR`（ONNXRuntime 轻量高精度引擎）识别插图中的代码和文字，自动包装成 C++/Python 代码块或引用块插入 Markdown 原位置：
+### 4.2 纯文字大模型模式 (`--ocr`)
+自动通过 `RapidOCR`（ONNXRuntime 轻量高精度引擎）识别插图中的代码和文字，并通过 `clean_code_ocr` 进行代码启发式自愈（修复括号、赋值符与注释），自动包装成代码块或引用块插入 Markdown 原位置：
 ```bash
 python scripts/extract_chapter.py "book.mobi" --chapter "2.1 进入C++" --ocr
 ```
 
 ---
 
-## 4. 标准 CLI 调用命令
+## 5. 标准 CLI 调用命令
 
 ```bash
 # 1. 探针检查（支持 .epub / .mobi / .azw3 / .pdf）

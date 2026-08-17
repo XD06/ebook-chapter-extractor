@@ -8,7 +8,7 @@
 
 ### 🌟 Agent-Native 视觉的核心优势
 由于本模型/Agent **原生具备强大的多模态视觉能力**，可以直接“看”高分辨率图片：
-1. **零外部环境依赖**：只需 `pymupdf` 将 PDF 页面渲染为 PNG，无需安装任何 OCR 二进制软件；
+1. **零外部环境依赖**：只需 `pymupdf` 将 PDF 页面渲染为 PNG，无需安装任何复杂 OCR 二进制软件；
 2. **高保真版面与语义理解**：直接看清多栏排版、图表插图、代码缩进、数学公式、印章与手写批注；
 3. **精准页码核验与漂移自愈**：直接阅读页面顶部的页眉和底部的印刷页脚，一目了然验证逻辑页码与物理页偏移；
 4. **一键生成结构化 Markdown**：视觉直接转写即可得到标准的 `#` 标题、Markdown 表格、LaTeX `$$...$$` 公式。
@@ -22,7 +22,9 @@
        │
        ▼
 1. 页面高保真渲染 (Render)
-   python skills/pdf-chapter-extractor/scripts/render_page.py "book.pdf" --pages "19,20" --dpi 150
+   python scripts/render_page.py "book.pdf" -c "2.3.2" --dpi 150
+   # 或容错范围传参：
+   python scripts/render_page.py "book.pdf" 38 40 --dpi 150
        │
        ▼
 2. Agent 原生视觉读取 (Vision Inspection)
@@ -34,6 +36,12 @@
 3. 结构化 Markdown 交付 (Deliver)
    - 输出保留排版、表格与公式的高质量 Markdown
 ```
+
+### 扫描件智能降级与协同输出 (extract_chapter.py)
+在调用 `extract_chapter.py` 时，若探测到目标页码文字层为空（纯图片扫描版），脚本将自动执行智能协同输出：
+- 自动渲染目标页码为高清 PNG 原图；
+- 提示 Agent 多模态视觉直读原图路径；
+- 底部附带本地 RapidOCR/兜底引擎提取的离线文字通道，方便快速浏览与关键信息对照。
 
 ---
 
