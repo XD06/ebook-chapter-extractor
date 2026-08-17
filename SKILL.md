@@ -1,152 +1,138 @@
 ---
-name: pdf-chapter-extractor
-description: "PDF按章节按需解析与提取技能。针对大本工具书/教材/专著，通过目录定位、物理页计算与切片提取，按需解析目标章节，避免整本转换的巨大资源与时间开销。自动探测内嵌书签（get_toc）、自愈异常书签、无书签文本目录提取、偏移量校准（含扫描件漂移防御）；支持 PyMuPDF / MarkItDown（数字版）、Agent-Native 多模态视觉直读（扫描版/复杂排版/零OCR依赖）以及 MinerU VLM 精确解析（扫描版/文字LLM深度提取）。"
-when_to_use: 当用户要求查看、读取、提取、解析、总结 PDF 书籍的某个章节/部分，或者给定大 PDF 并针对特定章节提问时必须触发。
-  触发词："读取第X章"、"提取第X章"、"看看第X章"、"解析章节"、"PDF章节"、"只看这一章"、"提取目录"、"Contents"、"Million Dollar Weekend"、"计算机网络第2章"、"SQL必知必会"。
-  不触发：小于5页的简短PDF、非PDF文件、整本不需要拆分的全面单页文档。
+name: ebook-chapter-extractor
+description: "全格式电子书 (EPUB / MOBI / AZW3 / PDF) 按章节按需伴读与提取技能。为 AI Agent 量身定制，毫秒级快速定位并按需切片提取目标章节（0 Token、0 网络开销、拒绝整本读取）。支持流式电子书原生 Markdown 解析与 RapidOCR 回填（带原图路径与视觉自愈提示）；支持 PDF 书签自愈、印刷目录偏移量换算、多模态视觉直读 (render_page.py) 与 MinerU VLM 高精云端解析 (check_token.py)；内置分级依赖自愈检测 (env_checker.py)。"
+when_to_use: 当用户要求查看、伴读、辅导、读取、提取、解析、切片或总结电子书或 PDF (EPUB/MOBI/AZW3/PDF) 的某个章节/小节/页码范围，或告知自己正在学习/阅读书籍的某个部分时使用。
 ---
 
-# PDF 按章节按需解析 (PDF Chapter Extractor)
+# ebook-chapter-extractor (伴读与按需章节提取 SOP)
 
-本技能定义了从大本 PDF（数百至上千页）中**按需定位、切片与解析指定章节**的标准作业程序（SOP），避免整本转换的巨大资源消耗与延迟。
+## 0. 脚本与参考文件清单 (Architecture Map)
+
+| 文件路径 | 适用格式 | 阶段 / 角色 | 核心功能说明 |
+|---|---|---|---|
+| `scripts/probe.py` | 全格式 | 1. 探针 | 统一探针入口，嗅探格式、章节/总页数并推荐解析路线 |
+| `scripts/probe_pdf.py` | PDF | 1. 探针 | PDF 专用深度探针，嗅探文字层、书签状态及扫描件特征 |
+| `scripts/build_index.py` | 全格式 | 2. 索引 | 构建章节索引 `chapters.json`，内嵌 PDF 书签 `0/-1` 自愈算法 |
+| `scripts/extract_chapter.py` | 全格式 | 3. 提取 | 按章节名/序号/范围提取 MD、导出 PDF 切片、OCR 回填或 JSON 输出 |
+| `scripts/render_page.py` | PDF | 3. 视觉 | 将 PDF 指定页渲染为高清 PNG，供多模态 Agent 视觉直读 |
+| `scripts/check_token.py` | PDF | 3. 鉴权 | 探测 MinerU Token 状态，决定调用高精 VLM 还是兜底模式 |
+| `scripts/env_checker.py` | 全格式 | 底层支撑 | 分级依赖自愈检测与极速自动安装（Tier 1 基础解析 / Tier 2 OCR） |
+| `scripts/epub_parser.py` | EPUB | 解析引擎 | 纯 Python 流式解析，含章节合并、MathML 转 LaTeX 与 DOM 清洗 |
+| `scripts/mobi_parser.py` | MOBI/AZW3 | 解析引擎 | PalmDOC LZ77 瞬时解压与 KF8 原生解包，提取内嵌图片 |
+| `scripts/ocr_helper.py` | 全格式 | OCR 辅助 | RapidOCR 驱动、排版路径净化、代码语法块包装与原图路径关联 |
+| `scripts/mathml_helper.py` | 全格式 | 公式辅助 | MathML XML 标签向 LaTeX Markdown (`$...$`) AST 转换 |
+| `references/epub-pipeline.md` | 流式规范 | 参考指南 | EPUB / MOBI / AZW3 流式电子书技术流水线与细节规范 |
+| `references/min-pipeline.md` | 选型规范 | 参考指南 | 工具链选型全景矩阵与 MinerU Token 管理/用户引导规范 |
+| `references/offset-model.md` | PDF 规范 | 参考指南 | PDF 逻辑页/物理页体系、Offset 偏移量模型与扫描漂移防御 |
+| `references/vision-pipeline.md` | 视觉规范 | 参考指南 | Agent-Native 多模态视觉直读工作流与 SOP 指南 |
 
 ---
 
-## 一、 核心决策树与分流体系
+## 1. 核心决策树 (Decision Tree)
 
 ```text
-                           用户请求 PDF 目标章节
-                                     │
-                 ┌───────────────────┴───────────────────┐
-                 ▼                                       ▼
-        【分支 1：数字版 PDF】                   【分支 2：扫描版 / 图像 PDF】
-        (有清晰文字层，非图片)                    (扫描图像、双层PDF、无文字层)
-                 │                                       │
-                 ▼                                       ▼
-     ┌───────────────────────┐               ┌───────────────────────┐
-     │ 纯文本问答: PyMuPDF   │               │ 场景 A: 多模态视觉   │
-     │ 结构化排版: MarkItDown│               │   -> 高清渲染直读(1s) │
-     └───────────────────────┘               │ 场景 B: 纯文本 LLM    │
-                                             │   -> 见下方扫描件流水线│
-                                             └───────────────────────┘
+                           用户请求提取电子书/章节/页码
+                                       │
+                 ┌─────────────────────┴─────────────────────┐
+                 ▼                                           ▼
+      【流式电子书：EPUB/MOBI/AZW3】                     【固定版式：PDF】
+                 │                                           │
+         纯 Python 原生提取                           运行快速探针 probe.py
+      (0.05s, 0 Token, 0 网络)                               │
+                 │                         ┌─────────────────┴─────────────────┐
+        extract_chapter.py                 ▼                                   ▼
+                 │                   【数字版 PDF】                      【扫描版 / 图像 PDF】
+        ┌────────┴────────┐                │                                   │
+        ▼                 ▼          PyMuPDF / MarkItDown              ┌───────┴───────┐
+    纯文本章节       含代码图/插图           (1秒提取结构化 MD)                 ▼               ▼
+   (--format md)    (--ocr / --dump)                               【多模态视觉直读】  【纯文本 LLM 深度解析】
+                          │                                         render_page.py     check_token.py ->
+              自动导出原图+OCR回填                                     (1.5s 极速直读)    切片 -> MinerU VLM
+              带真实物理路径供 Agent 看图自愈
 ```
 
 ---
 
-## 二、 扫描版 + 纯文本 LLM 解析流水线（精准分流）
+## 2. 流式电子书 SOP (EPUB / MOBI / AZW3)
 
-当驱动主模型为**纯文本 LLM（无法直接输入图片）**时，按任务精度与页面特征执行确定性分流：
+流式电子书无页码偏移，100% 结构化还原，首选原生流式流水线。
 
-```text
-                     扫描版 PDF (已定位目标物理页)
-                                  │
-          ┌───────────────────────┴───────────────────────┐
-          ▼                                               ▼
-【场景 1：宏观总结 / 概念大意问答】              【场景 2：深度研读 / 表格 / 代码 / 公式】
-· 优先提取双层 PDF 自带文字层 (0ms)              · 严禁使用普通扁平 OCR (表格/代码必碎)
-· 纯图片使用 RapidOCR 本地快速提取 (0.3s/页)      · 切出目标 2~5 页小 PDF 切片
-· 毫秒级返回，满足基础问答                       · 优先使用 MinerU VLM 精确模式解析
-                                                          │
-                                                          ▼
-                                              检测环境 Token (MINERU_TOKEN / ~/.mineru/config.yaml)
-                                              ├─ 已配置: 调用 extract --model vlm (高精还原) ⭐ 首选
-                                              └─ 未配置:
-                                                   ├─ 引导用户提供 Token
-                                                   └─ 用户确实无法提供时，才降级 flash-extract (质量差、慢)
+```bash
+# 1. 极速提取目标章节为 Markdown（自动包含下辖子节，0 Token）
+python scripts/extract_chapter.py "book.epub" --chapter "Chapter 1" --format md
+
+# 2. 伴读推荐：启用 OCR 智能回填 + 自动导出高清原图（附带本地真实物理路径与看图校对提示）
+python scripts/extract_chapter.py "book.mobi" --chapter "3.1.3" --ocr -o chapter.md
+
+# 3. 导出全部插图供多模态 Agent 工具直读
+python scripts/extract_chapter.py "book.mobi" --chapter "2.1" --dump-images .cache/images/ -o chapter.md
+
+# 4. Agent 结构化交互（输出包含字数、插图路径的 JSON 数据）
+python scripts/extract_chapter.py "book.epub" --chapter "1.1" --json
 ```
 
 ---
 
-## 三、 标准执行 Core Loop（五步法）
+## 3. PDF 按需切片 SOP（五步法）
 
-### 阶段 1：快速探针（Probe）
-执行 `probe_pdf.py` 输出文档特征 JSON（总页数、是否有文字层、书签状态、推荐路线）：
+### 阶段 1：快速探针 (Probe)
 ```bash
-python skills/pdf-chapter-extractor/scripts/probe_pdf.py "<pdf_path>"
+python scripts/probe.py "book.pdf"
 ```
 
-### 阶段 2：索引与物理页定位（Locate & Heal）
-执行 `build_index.py`，内置**书签自愈算法**，自动修复大章页码为 `0/-1` 的脏数据：
+### 阶段 2：索引与书签自愈 (Locate & Heal)
 ```bash
-python skills/pdf-chapter-extractor/scripts/build_index.py "<pdf_path>" --print
+python scripts/build_index.py "book.pdf" --print
 ```
-* **有书签**：书签页码绝大多数即为物理页（1-based），自愈后直接切片；
-* **无书签**：提取印刷目录页逻辑页码 $\to$ 寻找正文 P1 物理页计算 Offset（`物理页 = 逻辑页 + Offset`）。
+* **有书签**：书签页码大多数即为物理页（1-based），自愈修复异常 `0/-1` 页码后直接定位。
+* **无书签**：从目录提取逻辑页码，通过正文 P1 物理页计算偏移量：
+  $$\text{物理页} = \text{逻辑页} + \text{Offset} \quad (\text{Offset} = \text{正文 P1 物理页} - 1)$$
 
-> ⚠️ **页面级图片检测（重要踩坑）**：探针判定为"数字版"不代表每页都有文字层。
-> 个别页（尤其**目录页**）可能是**扫描图片**（如《只是为了好玩》实测：整本数字版，唯独目录页 27-28 是图片，`get_text` 返回 0 行）。
-> **阶段 3 Sanity Check 若发现目标页文字为空，立即回退**：渲染该页为 PNG → 走「四、MinerU Token 优先」图片解析，**切勿误以为定位错误而跳过**。
+### 阶段 3：提取前自检 (Sanity Check)
+核验物理页前 3 行文字是否匹配章节名。若未匹配，在 $\pm 2$ 页微调以防御扫描件漂移；若目标页（如目录页）为纯图片且 `get_text` 为空，立即回退至渲染/图片解析模式。
 
-### 阶段 3：提取前自检（Sanity Check）
-提取物理第 $P$ 页前 3 行文字，核验是否包含目标章节标题关键字。若不匹配，前后滑动 1~2 页校准，防御扫描件 Offset 漂移。
-
-### 阶段 4：按需解析与执行（Execute）
-
-1. **数字版**：
+### 阶段 4：按需解析执行 (Execute)
+1. **数字版 PDF（极速 Markdown）**：
    ```bash
-   # 秒级转结构化 Markdown（推荐喂 AI）
-   python skills/pdf-chapter-extractor/scripts/extract_chapter.py "<pdf_path>" --chapter "<章节名>" --format md
+   python scripts/extract_chapter.py "book.pdf" --chapter "第2章" --format md
+   ```
+2. **扫描版 + 多模态 Agent（视觉直读，~1.5s，推荐）**：
+   ```bash
+   python scripts/render_page.py "book.pdf" --pages "264,265" --dpi 150
+   # Agent 调用看图工具直接读取生成的 PNG
+   ```
+3. **扫描版 + 纯文本 LLM（MinerU VLM 深度解析）**：
+   * **Step 0 检查 Token**：`python scripts/check_token.py`
+   * **Step 1 提取切片**：`python scripts/extract_chapter.py "book.pdf" --range "264-266" --format pdf -o slice.pdf`
+   * **Step 2 高精解析**：`mineru-open-api extract slice.pdf --model vlm -f md -o ./output/`
+
+### 阶段 5：沉淀与交付 (Deliver)
+缓存索引至 `.cache/chapters.json`，提取结果缓存至 `.cache/chapter_xx.md`，避免同一会话重复解析。
+
+---
+
+## 4. MinerU Token 管理与用户引导规范
+
+> ⚠️ **严禁硬编码**：脚本与文档严禁固化真实 Token。
+
+当纯文本 LLM 解析扫描件复杂表格/公式且未配置 Token 时，按以下规范引导用户获取与配置（严禁直接降级 `flash-extract`，仅当用户明确无法提供时方可降级）：
+1. 引导用户前往 [https://mineru.net/apiManage/token](https://mineru.net/apiManage/token) 获取免费 Token。
+2. 配置方式（**注：`mineru-open-api auth --token "..."` 在部分版本会卡交互，请使用以下安全方式**）：
+   ```powershell
+   # 方式 A（推荐，环境变量）：
+   $env:MINERU_TOKEN="your_token_here"
+
+   # 方式 B（持久化配置）：
+   "your_token_here" | mineru-open-api auth
+   mineru-open-api auth --verify
    ```
 
-2. **扫描版 + Agent 原生视觉（速度最快，~1.5秒）**：
-   ```bash
-   python skills/pdf-chapter-extractor/scripts/render_page.py "<pdf_path>" --pages "264" --dpi 150
-   # Agent 直接读取生成的 PNG 图片进行视觉理解与转写
-   ```
-
-3. **扫描版 + 纯文本 LLM（深度结构化提取）**：
-   * **第 0 步：检测 Token**（决定走精确还是兜底）：
-     ```bash
-     python skills/pdf-chapter-extractor/scripts/check_token.py
-     ```
-   * **第 1 步：切出目标小切片**：
-     ```bash
-     python skills/pdf-chapter-extractor/scripts/extract_chapter.py "<pdf_path>" --range "264-265" --format pdf --output slice.pdf
-     ```
-   * **第 2 步：Token 优先的 MinerU 提取**（**⭐ 默认走 Token 精确模式，绝不优先 flash-extract**）：
-     * **若已配置 Token**（`MINERU_TOKEN` 环境变量 或 `~/.mineru/config.yaml`）——**首选**：
-       ```bash
-       mineru-open-api extract slice.pdf --model vlm -f md -o ./output/
-       ```
-     * **若未配置 Token**：先按「四、MinerU Token 引导规范」引导用户提供 Token；
-       **仅当用户确实无法/不愿提供 Token 时**，才降级为 `flash-extract`（质量差、排队慢、公式易误识，仅作兜底）：
-       ```bash
-       mineru-open-api flash-extract slice.pdf -o ./output/
-       ```
-
-### 阶段 5：沉淀与交付（Cache & Deliver）
-* 索引缓存保存至 `.cache/chapters.json`；
-* 提取出的章节 Markdown 缓存至 `.cache/chapter_xx.md`，避免重复请求。
-
 ---
 
-## 四、 MinerU Token 引导规范（禁止硬编码 Token）
+## 5. 黄金守则 (Guardrails)
 
-在技能文档、脚本和代码中，**严禁固化/硬编码任何真实的 API Token**。统一通过环境变量或 CLI 鉴权。
-
-### Token 配置与用户引导标准话术
-当纯文本 LLM 需要高精度解析表格/公式且未检测到 Token 时，按以下规范引导用户：
-
-> 💡 **提示**：检测到当前解析涉及复杂表格/公式/代码段。为了获得最高精度的 VLM 结构化解析，建议配置 MinerU API Token（免费申请）：
-> 1. 前往官网获取 Token：[https://mineru.net/apiManage/token](https://mineru.net/apiManage/token)
-> 2. 执行命令配置（**注意：`mineru-open-api auth --token "..."` 在 v0.5.9 会卡在交互输入，勿用**）：
->    ```bash
->    # 方式 A (推荐，临时生效，仅当前会话)：设置环境变量
->    $env:MINERU_TOKEN="your_token_here"
->
->    # 方式 B (持久化，写入 ~/.mineru/config.yaml)：管道输入，避免卡交互
->    "your_token_here" | mineru-open-api auth
->
->    # 验证配置是否生效
->    mineru-open-api auth --verify
->    ```
-
----
-
-## 五、 黄金守则（Guardrails）
-
-1. **先切后送，严禁全本提交**：扫描件超过 20 页严禁一次性提交 MinerU，必须切出目标 2~5 页子段后再提交。
-2. **数字版常规页杜绝 MinerU/OCR**：数字版正文直接走 MarkItDown/PyMuPDF，1 秒搞定，不产生任何网络开销与排队；**但若个别页（如目录页）是图片、`get_text` 为空，则例外回退到 MinerU Token 解析**（见阶段 2 提示）。
-3. **多模态视觉优先**：当运行环境支持图像输入时，优先采用 `render_page.py` 视觉直读，速度比云端 API 快数十倍。
-4. **Token 优先于 flash-extract**：扫描件深度解析时，**默认使用 Token 精确模式**（`extract --model vlm`）；仅当用户明确无法提供 Token 时才降级 `flash-extract`（质量差、慢）。
-5. **Token 安全隔离**：Token 仅通过环境变量或外部配置读取，绝不写入版本库或持久化 Skill 文件。
+1. **流式 0 Token 绝对优先**：遇到 EPUB / MOBI / AZW3 坚决走纯 Python 原生提取，严禁走 OCR 或大模型视觉。
+2. **先切片后送 MinerU**：扫描件超过 20 页严禁一次性提交 MinerU，必须切出 2~5 页子切片。
+3. **数字版常规页杜绝 MinerU/OCR**：数字版直接走 MarkItDown/PyMuPDF，秒级交付。
+4. **Token 严格安全隔离**：Token 仅走环境变量与外部配置文件，严禁写入代码库。
+5. **图文双轨原图校对**：OCR 遇到排版歧义时，多模态 Agent 依据 Markdown 附带的真实物理路径主动看图自愈。

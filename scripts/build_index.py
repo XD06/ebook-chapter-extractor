@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-build_index.py - PDF 章节索引构建工具 (带书签自愈/修复算法)
-解析 PDF 的内嵌书签或前置目录页，计算每个章节的起止物理页码范围 [Start, End]，
-并导出结构化 chapters.json 索引文件。
+build_index.py - 电子书章节索引构建工具 (支持 PDF / EPUB / MOBI / AZW3)
+- PDF: 解析内嵌书签(内置自愈修复算法)或前置目录页，计算起止物理页码范围 [Start, End]
+- EPUB / MOBI / AZW3: 解析 NCX / NAV / Spine 结构，提取完整章节树
+导出统一结构化的 chapters.json 索引文件。
 """
 
 import sys
@@ -11,19 +12,23 @@ import re
 import json
 import argparse
 
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
+from env_checker import ensure_core_dependencies
+ensure_core_dependencies()
+
 try:
     import pymupdf
 except ImportError:
     try:
         import fitz as pymupdf
     except ImportError:
-        print("Error: PyMuPDF is required. Run: pip install pymupdf")
-        sys.exit(1)
+        pymupdf = None
 
 
 def heal_toc(toc: list, total_pages: int) -> list:
     """
-    自愈/清洗书签列表：
+    自愈/清洗书签列表（PDF 专用）：
     1. 修正 <= 0 的异常书签（向后/向下查找首个有效子节点页码提升修复）；
     2. 过滤完全无效的前置项；
     3. 保证页码在 [1, total_pages] 合法范围内。
@@ -60,7 +65,8 @@ def heal_toc(toc: list, total_pages: int) -> list:
     return valid_toc
 
 
-def build_from_toc(doc: pymupdf.Document) -> list:
+def build_from_toc(doc) -> list:
+    """PDF 专用：从内嵌书签构建章节索引"""
     raw_toc = doc.get_toc()
     if not raw_toc:
         return []
@@ -94,8 +100,8 @@ def build_from_toc(doc: pymupdf.Document) -> list:
     return index
 
 
-def build_from_text_toc(doc: pymupdf.Document, max_scan_pages: int = 20) -> list:
-    """无书签时，从前置文本目录提取"""
+def build_from_text_toc(doc, max_scan_pages: int = 20) -> list:
+    """PDF 专用：无书签时，从前置文本目录提取并计算 Offset"""
     total = doc.page_count
     toc_pages = []
 
@@ -114,7 +120,7 @@ def build_from_text_toc(doc: pymupdf.Document, max_scan_pages: int = 20) -> list
         for line in lines:
             line = line.strip()
             # 匹配 标题 ..... 123
-            m = re.match(r"^(.+?)[.\uff0e\u00b7\s]{2,}(\d+)\s*$", line)
+            m = re.match(r"^(.+?)[.．·\s]{2,}(\d+)\s*$", line)
             if m:
                 t, logical_p = m.group(1).strip(), int(m.group(2))
                 if len(t) >= 2 and not t.isdigit():
@@ -134,7 +140,6 @@ def build_from_text_toc(doc: pymupdf.Document, max_scan_pages: int = 20) -> list
     # 若无 label，默认根据首个章节提取逻辑值反推（假设首章在目录后几页）
     if offset == 0 and extracted:
         first_logical = extracted[0][1]
-        # 假设首个目录页之后即正文
         est_phys = (toc_pages[-1] + 1) + 1  # 1-based
         offset = max(0, est_phys - first_logical)
 
@@ -152,23 +157,16 @@ def build_from_text_toc(doc: pymupdf.Document, max_scan_pages: int = 20) -> list
             "title": t,
             "start_phys": start_phys,
             "end_phys": end_phys,
-            "page_count": end_phys - start_phys + 1
+            "page_count": end_page - start_phys + 1
         })
 
     return index
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Build and save PDF chapter index.")
-    parser.add_argument("pdf_path", help="Path to PDF file")
-    parser.add_argument("--output", "-o", default=None, help="Output JSON path (default: .cache/<pdf_name>_chapters.json)")
-    parser.add_argument("--print", "-p", action="store_true", help="Print table to stdout")
-    args = parser.parse_args()
-
-    pdf_path = os.path.abspath(args.pdf_path)
-    if not os.path.exists(pdf_path):
-        print(f"Error: PDF not found: {pdf_path}")
-        sys.exit(1)
+def build_pdf_index(pdf_path: str) -> dict:
+    """PDF 索引统一入口"""
+    if pymupdf is None:
+        raise RuntimeError("PyMuPDF is required for PDF indexing. Run: pip install pymupdf")
 
     doc = pymupdf.open(pdf_path)
     index = build_from_toc(doc)
@@ -179,37 +177,102 @@ def main():
         source = "extracted text TOC + offset"
 
     if not index:
-        print("Warning: Could not automatically detect TOC or bookmarks. Empty index generated.")
-        index = []
+        source = "none (no TOC or bookmarks found)"
+
+    return {
+        "file_path": pdf_path,
+        "format": "PDF",
+        "total_pages": doc.page_count,
+        "source": source,
+        "chapters": index
+    }
+
+
+def build_epub_index(epub_path: str) -> dict:
+    """EPUB 索引统一入口"""
+    from epub_parser import EpubBook
+    with EpubBook(epub_path) as book:
+        return {
+            "file_path": epub_path,
+            "format": "EPUB",
+            "title": book.metadata.get("title", ""),
+            "author": book.metadata.get("author", ""),
+            "total_chapters": len(book.toc),
+            "source": "EPUB TOC (NCX / NAV / Spine)",
+            "chapters": book.toc
+        }
+
+
+def build_mobi_index(mobi_path: str) -> dict:
+    """MOBI / AZW3 索引统一入口"""
+    from mobi_parser import MobiBook
+    with MobiBook(mobi_path) as book:
+        return {
+            "file_path": mobi_path,
+            "format": "MOBI/AZW3",
+            "title": book.header_info.get("title", ""),
+            "total_chapters": len(book.toc),
+            "source": "MOBI / KF8 TOC",
+            "chapters": book.toc
+        }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Build and save eBook (PDF/EPUB/MOBI/AZW3) chapter index.")
+    parser.add_argument("file_path", help="Path to eBook file (PDF, EPUB, MOBI, AZW3)")
+    parser.add_argument("--output", "-o", default=None, help="Output JSON path (default: .cache/<file_stem>_chapters.json)")
+    parser.add_argument("--print", "-p", action="store_true", help="Print table to stdout")
+    args = parser.parse_args()
+
+    file_path = os.path.abspath(args.file_path)
+    if not os.path.exists(file_path):
+        print(f"Error: File not found: {file_path}")
+        sys.exit(1)
+
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".epub":
+        result = build_epub_index(file_path)
+    elif ext in (".mobi", ".azw", ".azw3", ".prc"):
+        result = build_mobi_index(file_path)
+    else:
+        # 默认作为 PDF 解析
+        result = build_pdf_index(file_path)
+
+    chapters = result.get("chapters", [])
 
     # 确定输出路径
     if not args.output:
-        base_dir = os.path.dirname(pdf_path)
-        pdf_stem = os.path.splitext(os.path.basename(pdf_path))[0]
+        base_dir = os.path.dirname(file_path)
+        stem = os.path.splitext(os.path.basename(file_path))[0]
         cache_dir = os.path.join(base_dir, ".cache")
         os.makedirs(cache_dir, exist_ok=True)
-        args.output = os.path.join(cache_dir, f"{pdf_stem}_chapters.json")
+        args.output = os.path.join(cache_dir, f"{stem}_chapters.json")
 
     with open(args.output, "w", encoding="utf-8") as f:
-        json.dump({
-            "pdf_path": pdf_path,
-            "total_pages": doc.page_count,
-            "source": source,
-            "chapters": index
-        }, f, ensure_ascii=False, indent=2)
+        json.dump(result, f, ensure_ascii=False, indent=2)
 
-    print(f"Successfully generated chapter index ({len(index)} entries, source: {source})")
+    fmt = result.get("format", "eBook")
+    print(f"Successfully generated {fmt} chapter index ({len(chapters)} entries, source: {result.get('source', 'auto')})")
     print(f" Saved to: {args.output}")
 
-    if args.print and index:
+    if args.print and chapters:
         print("\n" + "=" * 80)
-        print(f"{'#':<4} | {'章节标题':<40} | {'物理页范围':<12} | {'页数'}")
-        print("-" * 80)
-        for item in index:
-            indent = "  " * (item["level"] - 1) if "level" in item else ""
-            title_display = (indent + item["title"])[:40]
-            rng = f"{item['start_phys']}-{item['end_phys']}"
-            print(f"{item['index']:<4} | {title_display:<40} | {rng:<12} | {item['page_count']}")
+        if fmt == "PDF":
+            print(f"{'#':<4} | {'章节标题':<40} | {'物理页范围':<12} | {'页数'}")
+            print("-" * 80)
+            for item in chapters:
+                indent = "  " * (item["level"] - 1) if "level" in item else ""
+                title_display = (indent + item["title"])[:40]
+                rng = f"{item['start_phys']}-{item['end_phys']}"
+                print(f"{item['index']:<4} | {title_display:<40} | {rng:<12} | {item['page_count']}")
+        else:
+            print(f"{'#':<4} | {'章节标题':<45} | {'来源文件 / 锚点'}")
+            print("-" * 80)
+            for item in chapters:
+                indent = "  " * (item.get("level", 1) - 1)
+                title_display = (indent + item["title"])[:45]
+                src = item.get("src") or item.get("file_path") or f"Offset {item.get('char_offset', 0)}"
+                print(f"{item['index']:<4} | {title_display:<45} | {src}")
         print("=" * 80)
 
 

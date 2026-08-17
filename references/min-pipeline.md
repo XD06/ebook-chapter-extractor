@@ -1,12 +1,13 @@
-# MinerU 与工具链选型流水线指南
+# 电子书与工具链选型流水线全景指南
 
 ## 1. 工具选型全景矩阵
 
-| 工具 | 适用场景 | 平均速度 | 核心优势 | 局限性 / 劣势 | 依赖与配置 |
+| 工具 / 引擎 | 适用场景 | 平均速度 | 核心优势 | 局限性 / 劣势 | 依赖与配置 |
 |---|---|---|---|---|---|
-| **Agent-Native 视觉直读** | **扫描版/复杂排版/首选方案** | **~1.5秒** | 零网络依赖、零排队、保真度极高，代码缩进与 LaTeX 完美还原 | 仅适用于支持多模态图像的模型 | `pip install pymupdf` |
-| **MarkItDown** | **原生数字版 PDF 最佳选择** | **~1秒** | 毫秒级提取，保留标题、表格、代码块，输出整洁 Markdown | 不支持纯图片扫描件 OCR | `pip install "markitdown[pdf]"` |
-| **MinerU (`extract --model vlm`)** | **扫描版/纯文本LLM深度解析首选** | **~20-30秒** | **高精 VLM 驱动**，表格重建 HTML，公式 LaTeX，代码自动缩进 | 需配置 `MINERU_TOKEN`，需切片 | `npm install -g mineru-open-api` |
+| **原生 EPUB/MOBI/AZW3 引擎** | **流式电子书（EPUB, MOBI, AZW3）** | **0.05秒** | **零网络依赖、零 Token 开销、100% 结构化精准还原**，代码表格完美无损，无需 Offset | 仅适用于流式电子书文件 | 纯 Python 内置（`zipfile` + `bs4`） |
+| **Agent-Native 视觉直读** | **扫描版/复杂排版 PDF 首选方案** | **~1.5秒** | 零网络依赖、零排队、保真度极高，代码缩进与 LaTeX 完美还原 | 仅适用于支持多模态图像的模型 | `pip install pymupdf` |
+| **MarkItDown / PyMuPDF** | **原生数字版 PDF 最佳选择** | **~1秒** | 毫秒级提取，保留标题、表格、代码块，输出整洁 Markdown | 不支持纯图片扫描件 OCR | `pip install "markitdown[pdf]"` |
+| **MinerU (`extract --model vlm`)** | **扫描版/纯文本LLM深度解析首选** | **~20-30秒** | **高精 VLM 驱动**，表格重建成 HTML，公式 LaTeX，代码自动缩进 | 需配置 `MINERU_TOKEN`，需切片 | `npm install -g mineru-open-api` |
 | **MinerU (`flash-extract`)** | **仅作无 Token 时的最后兜底**（质量差、排队慢、公式易误识） | ~60秒 | 免登录、免 Token | 排队时间长，公式误识（如 ∞→8、ux→Lx、表格丢格） | `npm install -g mineru-open-api` |
 | **PyMuPDF (`get_text`)** | 双层 PDF 快速概念问答 | **0.01秒** | 极致速度，零延迟 | 丢失复杂表格与代码排版 | `pip install pymupdf` |
 
@@ -61,19 +62,16 @@
 
 ---
 
-## 4. MinerU 最佳实战命令集
+## 4. 最佳实战命令集
 
-### (1) 先切片（严禁整本上传）
+### (1) 流式电子书解析（EPUB / MOBI / AZW3）
 ```bash
-python skills/pdf-chapter-extractor/scripts/extract_chapter.py "large_book.pdf" --range "264-266" --format pdf --output slice.pdf
+python scripts/probe.py "book.epub"
+python scripts/extract_chapter.py "book.epub" --chapter "第1章" --format md
 ```
 
-### (2) 精确 VLM 解析（有 Token，**默认首选**，速度快、效果最好）
+### (2) PDF 切片提取与精准模式
 ```bash
+python scripts/extract_chapter.py "large_book.pdf" --range "264-266" --format pdf --output slice.pdf
 mineru-open-api extract slice.pdf --model vlm -f md -o ./output/
-```
-
-### (3) 免 Token 快速模式（**仅当用户确实无法提供 Token 时的最后兜底**）
-```bash
-mineru-open-api flash-extract slice.pdf -o ./output/
 ```
