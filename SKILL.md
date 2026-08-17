@@ -48,11 +48,11 @@ when_to_use: 当用户要求查看、读取、提取、解析、总结 PDF 书�
 · 毫秒级返回，满足基础问答                       · 优先使用 MinerU VLM 精确模式解析
                                                           │
                                                           ▼
-                                              检测环境 Token (MINERU_TOKEN)
-                                              ├─ 已配置: 调用 extract --model vlm (高精还原)
+                                              检测环境 Token (MINERU_TOKEN / ~/.mineru/config.yaml)
+                                              ├─ 已配置: 调用 extract --model vlm (高精还原) ⭐ 首选
                                               └─ 未配置:
-                                                   ├─ 引导用户获取 Token
-                                                   └─ 降级执行 flash-extract
+                                                   ├─ 引导用户提供 Token
+                                                   └─ 用户确实无法提供时，才降级 flash-extract (质量差、慢)
 ```
 
 ---
@@ -73,6 +73,10 @@ python skills/pdf-chapter-extractor/scripts/build_index.py "<pdf_path>" --print
 * **有书签**：书签页码绝大多数即为物理页（1-based），自愈后直接切片；
 * **无书签**：提取印刷目录页逻辑页码 $\to$ 寻找正文 P1 物理页计算 Offset（`物理页 = 逻辑页 + Offset`）。
 
+> ⚠️ **页面级图片检测（重要踩坑）**：探针判定为"数字版"不代表每页都有文字层。
+> 个别页（尤其**目录页**）可能是**扫描图片**（如《只是为了好玩》实测：整本数字版，唯独目录页 27-28 是图片，`get_text` 返回 0 行）。
+> **阶段 3 Sanity Check 若发现目标页文字为空，立即回退**：渲染该页为 PNG → 走「四、MinerU Token 优先」图片解析，**切勿误以为定位错误而跳过**。
+
 ### 阶段 3：提取前自检（Sanity Check）
 提取物理第 $P$ 页前 3 行文字，核验是否包含目标章节标题关键字。若不匹配，前后滑动 1~2 页校准，防御扫描件 Offset 漂移。
 
@@ -91,18 +95,23 @@ python skills/pdf-chapter-extractor/scripts/build_index.py "<pdf_path>" --print
    ```
 
 3. **扫描版 + 纯文本 LLM（深度结构化提取）**：
+   * **第 0 步：检测 Token**（决定走精确还是兜底）：
+     ```bash
+     python skills/pdf-chapter-extractor/scripts/check_token.py
+     ```
    * **第 1 步：切出目标小切片**：
      ```bash
      python skills/pdf-chapter-extractor/scripts/extract_chapter.py "<pdf_path>" --range "264-265" --format pdf --output slice.pdf
      ```
-   * **第 2 步：Token 优先的 MinerU 提取**：
-     * **若已配置 Token**（推荐）：
+   * **第 2 步：Token 优先的 MinerU 提取**（**⭐ 默认走 Token 精确模式，绝不优先 flash-extract**）：
+     * **若已配置 Token**（`MINERU_TOKEN` 环境变量 或 `~/.mineru/config.yaml`）——**首选**：
        ```bash
-       mineru-open-api extract slice.pdf --model vlm -f md
+       mineru-open-api extract slice.pdf --model vlm -f md -o ./output/
        ```
-     * **若未配置 Token**：引导用户配置，临时降级为 `flash-extract`：
+     * **若未配置 Token**：先按「四、MinerU Token 引导规范」引导用户提供 Token；
+       **仅当用户确实无法/不愿提供 Token 时**，才降级为 `flash-extract`（质量差、排队慢、公式易误识，仅作兜底）：
        ```bash
-       mineru-open-api flash-extract slice.pdf
+       mineru-open-api flash-extract slice.pdf -o ./output/
        ```
 
 ### 阶段 5：沉淀与交付（Cache & Deliver）
@@ -120,13 +129,16 @@ python skills/pdf-chapter-extractor/scripts/build_index.py "<pdf_path>" --print
 
 > 💡 **提示**：检测到当前解析涉及复杂表格/公式/代码段。为了获得最高精度的 VLM 结构化解析，建议配置 MinerU API Token（免费申请）：
 > 1. 前往官网获取 Token：[https://mineru.net/apiManage/token](https://mineru.net/apiManage/token)
-> 2. 执行命令配置：
+> 2. 执行命令配置（**注意：`mineru-open-api auth --token "..."` 在 v0.5.9 会卡在交互输入，勿用**）：
 >    ```bash
->    # 方式 A (推荐)：设置环境变量
+>    # 方式 A (推荐，临时生效，仅当前会话)：设置环境变量
 >    $env:MINERU_TOKEN="your_token_here"
 >
->    # 方式 B：CLI 交互认证
->    mineru-open-api auth --token "your_token_here"
+>    # 方式 B (持久化，写入 ~/.mineru/config.yaml)：管道输入，避免卡交互
+>    "your_token_here" | mineru-open-api auth
+>
+>    # 验证配置是否生效
+>    mineru-open-api auth --verify
 >    ```
 
 ---
@@ -134,6 +146,7 @@ python skills/pdf-chapter-extractor/scripts/build_index.py "<pdf_path>" --print
 ## 五、 黄金守则（Guardrails）
 
 1. **先切后送，严禁全本提交**：扫描件超过 20 页严禁一次性提交 MinerU，必须切出目标 2~5 页子段后再提交。
-2. **数字版杜绝使用 MinerU/OCR**：数字版直接走 MarkItDown/PyMuPDF，1 秒搞定，不产生任何网络开销与排队。
+2. **数字版常规页杜绝 MinerU/OCR**：数字版正文直接走 MarkItDown/PyMuPDF，1 秒搞定，不产生任何网络开销与排队；**但若个别页（如目录页）是图片、`get_text` 为空，则例外回退到 MinerU Token 解析**（见阶段 2 提示）。
 3. **多模态视觉优先**：当运行环境支持图像输入时，优先采用 `render_page.py` 视觉直读，速度比云端 API 快数十倍。
-4. **Token 安全隔离**：Token 仅通过环境变量或外部配置读取，绝不写入版本库或持久化 Skill 文件。
+4. **Token 优先于 flash-extract**：扫描件深度解析时，**默认使用 Token 精确模式**（`extract --model vlm`）；仅当用户明确无法提供 Token 时才降级 `flash-extract`（质量差、慢）。
+5. **Token 安全隔离**：Token 仅通过环境变量或外部配置读取，绝不写入版本库或持久化 Skill 文件。

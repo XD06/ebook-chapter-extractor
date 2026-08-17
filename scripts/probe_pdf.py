@@ -51,10 +51,10 @@ def probe(pdf_path: str) -> dict:
         recommendation = "Extract TOC text from front pages -> compute offset -> MarkItDown"
     elif not is_digital and has_toc:
         category = "C (Scanned + Has TOC)"
-        recommendation = "Slice target pages -> mineru-open-api flash-extract (<=20 pages)"
+        recommendation = "Slice target pages -> mineru-open-api extract --model vlm (Token优先; 无Token才flash-extract, <=20 pages)"
     else:
         category = "D (Scanned + No TOC)"
-        recommendation = "OCR TOC pages -> detect chapter title / calibrate page footer -> MinerU slice"
+        recommendation = "OCR TOC pages -> detect chapter title / calibrate page footer -> MinerU extract --model vlm (Token优先)"
 
     # 提取精简目录样本
     toc_sample = []

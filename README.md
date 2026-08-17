@@ -43,6 +43,7 @@
 | `build_index.py` | 2. 索引 | 书签自愈 + 构建章节物理页索引，导出 `chapters.json` |
 | `extract_chapter.py` | 4. 提取 | 按章节/页范围提取为文本、Markdown、子 PDF 切片 |
 | `render_page.py` | 4. 视觉 | 扫描页渲染高清 PNG，供 Agent 多模态视觉直读 |
+| `check_token.py` | 4. 检测 | 检测 MinerU Token 配置状态，决定走精确 VLM 还是兜底 flash-extract |
 
 ### 依赖
 
@@ -76,9 +77,11 @@ python scripts/extract_chapter.py "<pdf_path>" --chapter "第2章" --format md
 # 扫描版 + Agent 原生视觉（最快，~1.5s）
 python scripts/render_page.py "<pdf_path>" --pages "264" --dpi 150
 
-# 扫描版 + 纯文本 LLM（先切小切片，再送 MinerU VLM）
+# 扫描版 + 纯文本 LLM（先切小切片，再送 MinerU，Token 优先）
+python scripts/check_token.py                      # 检测 Token
 python scripts/extract_chapter.py "<pdf_path>" --range "264-265" --format pdf --output slice.pdf
-mineru-open-api extract slice.pdf --model vlm -f md
+mineru-open-api extract slice.pdf --model vlm -f md   # ⭐ Token 精确模式（首选）
+# 无 Token 才降级：mineru-open-api flash-extract slice.pdf
 ```
 
 ---
@@ -103,12 +106,19 @@ mineru-open-api extract slice.pdf --model vlm -f md
 
 > 免费申请 Token：<https://mineru.net/apiManage/token>
 
+**Token 优先原则**：扫描件深度解析时**默认使用 Token 精确模式**（`extract --model vlm`，高保真还原表格/公式/代码），仅在用户确实无法提供 Token 时才降级 `flash-extract`（质量差、排队慢）。
+
 ```bash
-# 推荐：环境变量（临时）
+# 检测 Token 状态
+python scripts/check_token.py
+
+# 推荐：环境变量（临时生效）
 $env:MINERU_TOKEN="your_token_here"
 
-# 或：CLI 交互认证（持久化）
-mineru-open-api auth
+# 或：管道输入写入配置（持久化，避免卡交互）
+"your_token_here" | mineru-open-api auth
+
+# 注：`mineru-open-api auth --token "..."` 在 v0.5.9 会卡在交互输入，勿用
 ```
 
 ---
@@ -116,9 +126,10 @@ mineru-open-api auth
 ## ⚠️ 黄金守则（Guardrails）
 
 1. **先切后送，严禁全本提交**：扫描件超过 20 页严禁一次性提交 MinerU，必须切出 2~5 页子段
-2. **数字版杜绝 MinerU/OCR**：数字版直接走 MarkItDown/PyMuPDF，1 秒搞定
+2. **数字版常规页杜绝 MinerU/OCR**：数字版正文直接走 MarkItDown/PyMuPDF，1 秒搞定；**但个别图片页（如目录页）`get_text` 为空时，例外回退到 MinerU Token 解析**
 3. **多模态视觉优先**：环境支持图像输入时，优先 `render_page.py` 视觉直读
-4. **Token 安全隔离**：Token 仅走环境变量/外部配置，绝不写入版本库
+4. **Token 优先**：扫描件深度解析默认用 Token 精确模式，仅用户无法提供 Token 时才降级 flash-extract
+5. **Token 安全隔离**：Token 仅走环境变量/外部配置，绝不写入版本库
 
 ---
 
