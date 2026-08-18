@@ -16,9 +16,11 @@ DEPENDENCY_TIERS = {
         ("pymupdf", "pymupdf"),            # PDF / 流式解析支撑
         ("bs4", "beautifulsoup4"),        # EPUB / MOBI DOM 解析
         ("html2text", "html2text"),       # 高保真 Markdown 转换
+        ("requests", "requests"),         # 网络请求与 PaddleOCR API 支持
     ],
     "ocr": [
-        ("rapidocr_onnxruntime", "rapidocr_onnxruntime"),  # 轻量高精度 OCR 引擎
+        ("rapidocr_onnxruntime", "rapidocr_onnxruntime"),  # 本地轻量高精度 OCR 引擎
+        ("requests", "requests"),                          # 百度飞桨高精 API 支持
     ]
 }
 

@@ -17,7 +17,7 @@ import json
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from env_checker import ensure_core_dependencies, ensure_ocr_dependencies
-from ocr_helper import get_cache_dir, ocr_image, clean_ocr_text, clean_code_ocr
+from ocr_helper import get_cache_dir, ocr_image, ocr_images_batch, clean_ocr_text, clean_code_ocr
 ensure_core_dependencies()
 
 try:
@@ -219,11 +219,11 @@ def handle_pdf_extraction(args, pdf_path: str):
         imgs = render_images(doc, start_p, end_p, out_dir, args.dpi)
         print(f"[*] Scanned PDF detected ({total_chars} chars extracted). Rendered {len(imgs)} pages for Agent Vision.", file=sys.stderr)
 
-        # 运行 OCR 文本识别
+        # 运行 OCR 文本识别（多图/多页统一批量极速提取，Paddle 批量 API + RapidOCR 兜底）
+        ocr_results = ocr_images_batch(imgs, engine_name=args.ocr_engine)
         ocr_blocks = []
-        for i, img_p in enumerate(imgs):
+        for i, (img_p, ocr_res) in enumerate(zip(imgs, ocr_results)):
             phys_num = start_p + i
-            ocr_res = ocr_image(img_p, engine_name=args.ocr_engine)
             cleaned_res = clean_ocr_text(ocr_res)
             ocr_blocks.append(f"<!-- Page {phys_num} -->\n{cleaned_res}")
 
@@ -455,10 +455,13 @@ def main():
     parser.add_argument("--dpi", type=int, default=150, help="DPI for PDF image rendering")
     parser.add_argument("--ocr", action="store_true", help="Enable OCR recognition for embedded images / scanned PDF into Markdown")
     parser.add_argument("--dump-images", nargs="?", const=True, default=False, help="Dump embedded chapter images to folder (for Vision LLM reading)")
-    parser.add_argument("--ocr-engine", choices=["rapidocr", "win_ocr", "pytesseract", "easyocr"], help="Specify OCR engine (default: auto detect)")
+    parser.add_argument("--ocr-engine", choices=["paddleocr", "rapidocr", "paddle", "rapid"], help="Specify OCR engine: 'paddleocr' (Baidu AI Studio API) or 'rapidocr' (local fallback, default: auto)")
+    parser.add_argument("--paddle-token", help="Baidu PaddleOCR API Token (overrides environment variable / config)")
     parser.add_argument("--json", action="store_true", help="Output result as JSON object with metadata (Agent friendly)")
 
     args = parser.parse_args()
+    if args.paddle_token:
+        os.environ["PADDLEOCR_TOKEN"] = args.paddle_token.strip()
     file_path = os.path.abspath(args.file_path)
     if not os.path.exists(file_path):
         print(f"Error: File not found: {file_path}")

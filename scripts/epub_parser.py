@@ -29,7 +29,7 @@ try:
 except ImportError:
     html2text = None
 
-from ocr_helper import detect_image_ext, ocr_image, format_ocr_markdown, get_cache_dir
+from ocr_helper import detect_image_ext, ocr_image, ocr_images_batch, format_ocr_markdown, get_cache_dir
 from mathml_helper import convert_soup_mathml_to_latex
 
 
@@ -599,6 +599,8 @@ class EpubBook:
             enhance_pre_code_tags(soup)
 
             imgs = soup.find_all(["img", "image"])
+            pending_ocr_tasks = []
+
             for i, img in enumerate(imgs):
                 src = img.get("src") or img.get("xlink:href")
                 alt = img.get("alt", "").strip()
@@ -628,9 +630,8 @@ class EpubBook:
                         f.write(img_bytes)
 
                 if ocr:
-                    ocr_text = ocr_image(img_bytes, engine_name=ocr_engine)
                     ph_key = f"__EPUB_OCR_PLACEHOLDER_{i}__"
-                    placeholders[ph_key] = format_ocr_markdown(ocr_text, alt_text=alt or f"插图 {i + 1}", image_rel_path=saved_path)
+                    pending_ocr_tasks.append((ph_key, alt or f"插图 {i + 1}", saved_path, img_bytes))
                     p_tag = soup.new_tag("p")
                     p_tag.string = ph_key
                     img.replace_with(p_tag)
@@ -639,6 +640,12 @@ class EpubBook:
                         img["xlink:href"] = saved_path
                     else:
                         img["src"] = saved_path
+
+            if pending_ocr_tasks:
+                images_to_ocr = [task[3] for task in pending_ocr_tasks]
+                ocr_texts = ocr_images_batch(images_to_ocr, engine_name=ocr_engine)
+                for (ph_key, alt_val, saved_path, _), ocr_text in zip(pending_ocr_tasks, ocr_texts):
+                    placeholders[ph_key] = format_ocr_markdown(ocr_text, alt_text=alt_val, image_rel_path=saved_path)
 
             processed_html = str(soup)
 
