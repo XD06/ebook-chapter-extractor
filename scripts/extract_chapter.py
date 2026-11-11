@@ -16,6 +16,7 @@ import json
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
+import console_safe  # noqa: F401  # 安装窄编码控制台保护（含非 GBK 字符的文件名）
 from env_checker import ensure_core_dependencies, ensure_ocr_dependencies
 from ocr_helper import get_cache_dir, ocr_image, ocr_images_batch, clean_ocr_text, clean_code_ocr
 ensure_core_dependencies()
@@ -33,10 +34,19 @@ except ImportError:
 # PDF 提取实现部分
 # ==============================================================================
 
-def find_pdf_chapter_range(doc, chapter_query: str) -> tuple:
-    """PDF 专用：在书签中查找匹配章节的物理起止页（支持前缀、数字、模糊匹配与书签自愈）"""
+def find_pdf_chapter_range(doc, chapter_query: str, pdf_path: str = None) -> tuple:
+    """
+    PDF 专用：查找匹配章节的物理起止页（支持前缀、数字、模糊匹配与书签自愈）。
+    无书签时自动回退到布局分析虚拟索引 (Paper Mode)，让无目录论文也能用 --chapter 提取。
+    """
     raw_toc = doc.get_toc()
     if not raw_toc:
+        if pdf_path:
+            from paper_parser import build_virtual_index, find_in_virtual_index
+            virtual = build_virtual_index(pdf_path)
+            if virtual:
+                print(f"[*] No bookmarks. Paper Mode: {len(virtual)} virtual headings from layout analysis.", file=sys.stderr)
+                return find_in_virtual_index(chapter_query, virtual)
         return None, None, None
 
     total_pages = doc.page_count
@@ -109,10 +119,13 @@ def find_pdf_chapter_range(doc, chapter_query: str) -> tuple:
     return target["title"], start_phys, end_phys
 
 
-def extract_pdf_as_text(doc, start_phys: int, end_phys: int) -> str:
+def extract_pdf_as_text(doc, start_phys: int, end_phys: int, column_aware: bool = False) -> str:
+    """按页提取文本；column_aware=True 时对双栏页面做「先左栏后右栏」阅读顺序重排"""
+    if column_aware:
+        from paper_parser import page_text_column_aware
     chunks = []
     for pno in range(start_phys - 1, end_phys):
-        text = doc[pno].get_text()
+        text = page_text_column_aware(doc[pno]) if column_aware else doc[pno].get_text()
         chunks.append(f"<!-- Page {pno + 1} -->\n{text}")
     return "\n\n".join(chunks)
 
@@ -179,9 +192,14 @@ def handle_pdf_extraction(args, pdf_path: str):
         end_p = int(parts[1]) if len(parts) > 1 else start_p
         ch_title = f"Page_{start_p}_{end_p}"
     elif args.chapter:
-        ch_title, start_p, end_p = find_pdf_chapter_range(doc, args.chapter)
+        if getattr(args, "paper_mode", False):
+            from paper_parser import build_virtual_index, find_in_virtual_index
+            ch_title, start_p, end_p = find_in_virtual_index(args.chapter, build_virtual_index(pdf_path))
+        else:
+            ch_title, start_p, end_p = find_pdf_chapter_range(doc, args.chapter, pdf_path)
         if start_p is None:
-            print(f"Error: Could not find chapter matching '{args.chapter}' in TOC.")
+            print(f"Error: Could not find chapter matching '{args.chapter}' in TOC or virtual layout index.", file=sys.stderr)
+            print("[*] Hint: `python scripts/build_index.py <pdf> --print` lists detected headings; or use --range <start-end>.", file=sys.stderr)
             sys.exit(1)
     else:
         print("Error: Must specify either --chapter or --range for PDF.")
@@ -268,7 +286,7 @@ def handle_pdf_extraction(args, pdf_path: str):
                     json.dump(result, f, ensure_ascii=False, indent=2)
                 print(f"Saved JSON to: {args.output}")
             else:
-                print(json.dumps(result, ensure_ascii=False, indent=2))
+                print(json.dumps(result, ensure_ascii=True, indent=2))
             return
 
         if args.output:
@@ -284,9 +302,15 @@ def handle_pdf_extraction(args, pdf_path: str):
     print(f"[*] Sanity Check (Page {start_p} first lines): {first_lines}", file=sys.stderr)
 
     if args.format == "text":
-        content = extract_pdf_as_text(doc, start_p, end_p)
+        content = extract_pdf_as_text(doc, start_p, end_p, column_aware=getattr(args, "column_aware", False))
     else:  # md
-        content = extract_pdf_as_markdown(doc, start_p, end_p, args.output)
+        # 传 None 避免内部提前写文件，统一由下方输出逻辑落盘 / 打印 / 打包 JSON
+        content = extract_pdf_as_markdown(doc, start_p, end_p, None)
+
+    # 显式开关：仅当用户要求时剥离文末参考文献，避免误伤普通电子书
+    if getattr(args, "strip_refs", False):
+        from paper_parser import strip_references
+        content = strip_references(content)
 
     if getattr(args, "json", False):
         result = {
@@ -311,7 +335,7 @@ def handle_pdf_extraction(args, pdf_path: str):
                 json.dump(result, f, ensure_ascii=False, indent=2)
             print(f"Saved JSON to: {args.output}")
         else:
-            print(json.dumps(result, ensure_ascii=False, indent=2))
+            print(json.dumps(result, ensure_ascii=True, indent=2))
         return
 
     if args.output:
@@ -431,7 +455,7 @@ def handle_ebook_extraction(args, file_path: str, ext: str):
                     json.dump(result, f, ensure_ascii=False, indent=2)
                 print(f"Saved JSON to: {args.output}")
             else:
-                print(json.dumps(result, ensure_ascii=False, indent=2))
+                print(json.dumps(result, ensure_ascii=True, indent=2))
             return
 
         if args.output:
@@ -458,6 +482,9 @@ def main():
     parser.add_argument("--ocr-engine", choices=["paddleocr", "rapidocr", "paddle", "rapid"], help="Specify OCR engine: 'paddleocr' (Baidu AI Studio API) or 'rapidocr' (local fallback, default: auto)")
     parser.add_argument("--paddle-token", help="Baidu PaddleOCR API Token (overrides environment variable / config)")
     parser.add_argument("--json", action="store_true", help="Output result as JSON object with metadata (Agent friendly)")
+    parser.add_argument("--strip-refs", action="store_true", help="[Paper Mode] Strip trailing References/Bibliography section (opt-in; never applied to eBooks by default)")
+    parser.add_argument("--column-aware", action="store_true", help="[Paper Mode] Reorder two-column PDF text left-column-first (for --format text)")
+    parser.add_argument("--paper-mode", action="store_true", help="[Paper Mode] Force layout-based virtual index even when bookmarks exist")
 
     args = parser.parse_args()
     if args.paddle_token:

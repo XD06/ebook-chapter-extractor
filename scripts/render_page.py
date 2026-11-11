@@ -12,6 +12,9 @@ import sys
 import os
 import re
 import argparse
+
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+import console_safe  # noqa: F401  # 安装窄编码控制台保护（含非 GBK 字符的文件名）
 from ocr_helper import get_cache_dir
 
 try:

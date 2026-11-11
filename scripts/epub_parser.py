@@ -680,7 +680,7 @@ def main():
     epub_path = sys.argv[1]
     with EpubBook(epub_path) as book:
         if "--probe" in sys.argv:
-            print(json.dumps(book.get_probe_info(), ensure_ascii=False, indent=2))
+            print(json.dumps(book.get_probe_info(), ensure_ascii=True, indent=2))
         elif "--list" in sys.argv:
             for item in book.toc:
                 indent = "  " * (item["level"] - 1)

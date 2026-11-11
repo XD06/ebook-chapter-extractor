@@ -626,7 +626,7 @@ def main():
     mobi_path = sys.argv[1]
     with MobiBook(mobi_path) as book:
         if "--probe" in sys.argv:
-            print(json.dumps(book.get_probe_info(), ensure_ascii=False, indent=2))
+            print(json.dumps(book.get_probe_info(), ensure_ascii=True, indent=2))
         elif "--list" in sys.argv:
             for item in book.toc:
                 indent = "  " * (item.get("level", 1) - 1)

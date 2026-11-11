@@ -14,6 +14,7 @@ import argparse
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
+import console_safe  # noqa: F401  # 安装窄编码控制台保护（含非 GBK 字符的文件名）
 from env_checker import ensure_core_dependencies
 ensure_core_dependencies()
 from ocr_helper import get_cache_dir
@@ -158,35 +159,49 @@ def build_from_text_toc(doc, max_scan_pages: int = 20) -> list:
             "title": t,
             "start_phys": start_phys,
             "end_phys": end_phys,
-            "page_count": end_page - start_phys + 1
+            "page_count": end_phys - start_phys + 1   # 修复: 原为未定义的 end_page，命中文本目录即崩溃
         })
 
     return index
 
 
-def build_pdf_index(pdf_path: str) -> dict:
-    """PDF 索引统一入口"""
+def build_pdf_index(pdf_path: str, force_layout: bool = False) -> dict:
+    """PDF 索引统一入口：书签 -> 文本目录 -> 布局分析虚拟索引 (Paper Mode) 三级回退"""
     if pymupdf is None:
         raise RuntimeError("PyMuPDF is required for PDF indexing. Run: pip install pymupdf")
 
     doc = pymupdf.open(pdf_path)
-    index = build_from_toc(doc)
-    source = "bookmarks (healed get_toc)"
+    try:
+        if force_layout:
+            from paper_parser import build_virtual_index
+            index = build_virtual_index(pdf_path)
+            source = "layout analysis (paper mode, forced)"
+        else:
+            index = build_from_toc(doc)
+            source = "bookmarks (healed get_toc)"
 
-    if not index:
-        index = build_from_text_toc(doc)
-        source = "extracted text TOC + offset"
+            if not index:
+                index = build_from_text_toc(doc)
+                source = "extracted text TOC + offset"
 
-    if not index:
-        source = "none (no TOC or bookmarks found)"
+            if not index:
+                from paper_parser import build_virtual_index
+                index = build_virtual_index(pdf_path)
+                source = "layout analysis (paper mode)"
 
-    return {
-        "file_path": pdf_path,
-        "format": "PDF",
-        "total_pages": doc.page_count,
-        "source": source,
-        "chapters": index
-    }
+        if not index:
+            source = "none (no TOC, bookmarks or layout headings found)"
+
+        return {
+            "file_path": pdf_path,
+            "format": "PDF",
+            "total_pages": doc.page_count,
+            "source": source,
+            "is_virtual": source.startswith("layout"),
+            "chapters": index
+        }
+    finally:
+        doc.close()
 
 
 def build_epub_index(epub_path: str) -> dict:
@@ -223,6 +238,7 @@ def main():
     parser.add_argument("file_path", help="Path to eBook file (PDF, EPUB, MOBI, AZW3)")
     parser.add_argument("--output", "-o", default=None, help="Output JSON path (default: .cache/<file_stem>_chapters.json)")
     parser.add_argument("--print", "-p", action="store_true", help="Print table to stdout")
+    parser.add_argument("--force-layout", action="store_true", help="Force layout-based virtual index (Paper Mode) even if bookmarks exist")
     args = parser.parse_args()
 
     file_path = os.path.abspath(args.file_path)
@@ -237,7 +253,7 @@ def main():
         result = build_mobi_index(file_path)
     else:
         # 默认作为 PDF 解析
-        result = build_pdf_index(file_path)
+        result = build_pdf_index(file_path, force_layout=args.force_layout)
 
     chapters = result.get("chapters", [])
 

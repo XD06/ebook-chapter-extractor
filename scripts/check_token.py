@@ -17,6 +17,9 @@ import json
 import argparse
 from pathlib import Path
 
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+import console_safe  # noqa: F401  # 安装窄编码控制台保护（含非 GBK 字符的文件名）
+
 
 def detect_mineru_token(token_arg: str | None = None) -> dict:
     """按优先级检测已配置的 MinerU Token（不暴露明文）"""
@@ -93,11 +96,11 @@ def main():
 
     if args.json:
         if args.mineru and not args.paddle:
-            print(json.dumps(mineru_info, ensure_ascii=False, indent=2))
+            print(json.dumps(mineru_info, ensure_ascii=True, indent=2))
         elif args.paddle and not args.mineru:
-            print(json.dumps(paddle_info, ensure_ascii=False, indent=2))
+            print(json.dumps(paddle_info, ensure_ascii=True, indent=2))
         else:
-            print(json.dumps({"mineru": mineru_info, "paddleocr": paddle_info}, ensure_ascii=False, indent=2))
+            print(json.dumps({"mineru": mineru_info, "paddleocr": paddle_info}, ensure_ascii=True, indent=2))
         return
 
     # 人性化控制台输出

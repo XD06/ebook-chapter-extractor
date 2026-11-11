@@ -12,6 +12,7 @@ import argparse
 # 添加 scripts 目录到模块查找路径
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
+import console_safe  # noqa: F401  # 安装窄编码控制台保护（含非 GBK 字符的文件名）
 from env_checker import ensure_core_dependencies
 ensure_core_dependencies()
 
@@ -52,12 +53,37 @@ def probe_pdf(pdf_path: str) -> dict:
 
     # 判断分类
     has_toc = len(toc) > 0
+
+    # 检测前置印刷目录页（与 build_index.build_from_text_toc 的判定保持一致）
+    has_text_toc = False
+    for i in range(min(20, total_pages)):
+        t = doc[i].get_text()
+        if "目录" in t or "Contents" in t or "TABLE OF CONTENTS" in t.upper():
+            has_text_toc = True
+            break
+
+    paper_headings = []
+    # 只对「数字版 + 无书签」触发布局分析；扫描件无文字层，应走 OCR 路线
+    if is_digital and not has_toc:
+        from paper_parser import detect_headings
+        paper_headings = detect_headings(pdf_path)
+
+    from paper_parser import classify_document
+    doc_class = (classify_document(doc) if is_digital else
+                 {"doc_type": "unknown", "is_two_column": False, "has_abstract": False})
+
     if is_digital and has_toc:
         category = "A (Digital + Has TOC)"
-        recommendation = "MarkItDown / PyMuPDF on physical pages directly (No offset needed)"
+        recommendation = "PyMuPDF / MarkItDown on physical pages directly (No offset needed)"
+    elif is_digital and has_text_toc:
+        category = "B1 (Digital + Printed TOC, No Bookmarks)"
+        recommendation = ("build_index.py first: extract printed TOC -> compute Offset -> PyMuPDF; "
+                          f"layout Paper Mode ({len(paper_headings)} headings) as fallback via --force-layout")
     elif is_digital and not has_toc:
-        category = "B (Digital + No TOC)"
-        recommendation = "Extract TOC text from front pages -> compute offset -> MarkItDown"
+        category = "B2 (Digital + No TOC - Paper Mode)"
+        col_hint = " Two-column detected: prefer --column-aware / visual read." if doc_class["is_two_column"] else ""
+        recommendation = (f"Paper Mode: {len(paper_headings)} virtual headings from layout analysis. "
+                          f"Use --chapter <heading> or --range <start-end>.{col_hint}")
     elif not is_digital and has_toc:
         category = "C (Scanned + Has TOC)"
         recommendation = "Slice target pages -> mineru-open-api extract --model vlm (Token优先; 无Token才flash-extract, <=20 pages)"
@@ -65,30 +91,38 @@ def probe_pdf(pdf_path: str) -> dict:
         category = "D (Scanned + No TOC)"
         recommendation = "OCR TOC pages -> detect chapter title / calibrate page footer -> MinerU extract --model vlm (Token优先)"
 
-    # 提取精简目录样本
+    # 提取精简目录样本（有书签用书签，否则用布局分析虚拟标题）
     toc_sample = []
-    for item in toc[:10]:
+    source_list = toc if has_toc else paper_headings
+    for item in source_list[:10]:
         toc_sample.append({
-            "level": item[0],
-            "title": item[1],
-            "page": item[2]
+            "level": item[0] if has_toc else 1,
+            "title": item[1] if has_toc else item["title"],
+            "page": item[2] if has_toc else item["phys"]
         })
 
-    return {
+    result = {
         "file": os.path.basename(pdf_path),
         "path": os.path.abspath(pdf_path),
         "format": "PDF",
         "total_pages": total_pages,
         "is_digital": is_digital,
         "has_toc": has_toc,
+        "has_text_toc": has_text_toc,
         "toc_count": len(toc),
         "category": category,
         "recommendation": recommendation,
+        "doc_type": doc_class["doc_type"],
+        "is_two_column": doc_class["is_two_column"],
+        "virtual_heading_count": len(paper_headings),
+        "paper_mode": bool(is_digital and not has_toc and not has_text_toc and paper_headings),
         "toc_sample": toc_sample,
         "sample_char_counts": char_counts,
         "title": meta.get("title", ""),
         "author": meta.get("author", "")
     }
+    doc.close()
+    return result
 
 
 def probe_epub(epub_path: str) -> dict:
@@ -135,7 +169,7 @@ def main():
     info = probe_file(args.file_path)
 
     if args.json or "error" in info:
-        print(json.dumps(info, ensure_ascii=False, indent=2))
+        print(json.dumps(info, ensure_ascii=True, indent=2))
         return
 
     fmt = info.get("format", "PDF")
@@ -152,11 +186,17 @@ def main():
         print(f"  * 章节文档数 : {info['total_spine_items']} 篇")
     print(f"  * 文档类型   : {'原生数字版 (有文本层/结构化HTML)' if info.get('is_digital', True) else '扫描图像版 (无文本层)'}")
     print(f"  * 目录状态   : {'有 (' + str(info.get('toc_count', 0)) + ' 条)' if info.get('has_toc') else '无目录'}")
+    if info.get("doc_type"):
+        col = ' / 双栏排版' if info.get('is_two_column') else ' / 单栏'
+        print(f"  * 文档形态   : {info['doc_type']}{col}")
+    if info.get("paper_mode"):
+        print(f"  * 虚拟章节   : Paper Mode 自动重建 {info.get('virtual_heading_count', 0)} 个标题")
     print(f"  * 决策分类   : 类别 {info.get('category', '未知')}")
     print(f"  * 推荐路线   : {info.get('recommendation', '标准解析')}")
 
     if info.get("toc_sample"):
-        print("\n[目录预览 (前 10 条)]")
+        label = "目录预览" if info.get("has_toc") else "布局分析虚拟章节预览"
+        print(f"\n[{label} (前 10 条)]")
         for it in info["toc_sample"]:
             indent = "  " * it.get("level", 1)
             page_info = f" (物理页: {it['page']})" if "page" in it else ""
