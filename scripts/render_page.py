@@ -15,7 +15,11 @@ import argparse
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 import console_safe  # noqa: F401  # 安装窄编码控制台保护（含非 GBK 字符的文件名）
+
+from env_checker import ensure_core_dependencies
+ensure_core_dependencies()
 from ocr_helper import get_cache_dir
+from pdf_helper import find_pdf_chapter_range
 
 try:
     import pymupdf
@@ -25,78 +29,6 @@ except ImportError:
     except ImportError:
         print("Error: PyMuPDF is required. Run: pip install pymupdf")
         sys.exit(1)
-
-
-def find_pdf_chapter_range(doc, chapter_query: str) -> tuple:
-    """在 PDF 书签中智能查找匹配章节的物理起止页（支持前缀、数字、模糊匹配）"""
-    raw_toc = doc.get_toc()
-    if not raw_toc:
-        return None, None, None
-
-    total_pages = doc.page_count
-    cleaned = []
-    for item in raw_toc:
-        level, title, page = item[0], item[1].strip(), item[2]
-        cleaned.append({"level": level, "title": title, "phys": page})
-
-    for i in range(len(cleaned)):
-        if cleaned[i]["phys"] <= 0:
-            cur_lv = cleaned[i]["level"]
-            for j in range(i + 1, len(cleaned)):
-                if cleaned[j]["level"] <= cur_lv:
-                    break
-                if cleaned[j]["phys"] > 0:
-                    cleaned[i]["phys"] = cleaned[j]["phys"]
-                    break
-
-    q = chapter_query.strip()
-    q_lower = q.lower()
-    q_norm = re.sub(r'[\s\-_.:：·]+', '', q_lower)
-
-    matched_idx = -1
-
-    for i, it in enumerate(cleaned):
-        if it["phys"] > 0 and it["title"].strip().lower() == q_lower:
-            matched_idx = i
-            break
-
-    if matched_idx == -1:
-        pattern = r'(?:^|[\s第])' + re.escape(q_lower) + r'(?:[\s.、:：章节]|$)'
-        for i, it in enumerate(cleaned):
-            if it["phys"] > 0:
-                t_lower = it["title"].lower()
-                if re.search(pattern, t_lower) or t_lower.startswith(q_lower):
-                    matched_idx = i
-                    break
-
-    if matched_idx == -1:
-        for i, it in enumerate(cleaned):
-            if it["phys"] > 0:
-                t_norm = re.sub(r'[\s\-_.:：·]+', '', it["title"].lower())
-                if q_norm in t_norm:
-                    matched_idx = i
-                    break
-
-    if matched_idx == -1:
-        for i, it in enumerate(cleaned):
-            if it["phys"] > 0 and q_lower in it["title"].lower():
-                matched_idx = i
-                break
-
-    if matched_idx == -1:
-        return None, None, None
-
-    target = cleaned[matched_idx]
-    start_phys = max(1, min(total_pages, target["phys"]))
-    cur_level = target["level"]
-    end_phys = total_pages
-
-    for it in cleaned[matched_idx + 1:]:
-        if it["level"] <= cur_level and it["phys"] >= start_phys:
-            end_phys = max(start_phys, min(total_pages, it["phys"] - 1))
-            break
-
-    return target["title"], start_phys, end_phys
 
 
 def render_pages(pdf_path: str, pages: list, output_dir: str = None, dpi: int = 150) -> list:
@@ -114,16 +46,19 @@ def render_pages(pdf_path: str, pages: list, output_dir: str = None, dpi: int = 
     os.makedirs(output_dir, exist_ok=True)
     saved_files = []
 
-    for p in pages:
-        if p < 1 or p > total:
-            print(f"Warning: Page {p} is out of bounds (1..{total}), skipping.")
-            continue
-        page = doc[p - 1]
-        pix = page.get_pixmap(dpi=dpi)
-        img_path = os.path.join(output_dir, f"page_{p:04d}.png")
-        pix.save(img_path)
-        saved_files.append(img_path)
-        print(f"[+] Rendered page {p}/{total} -> {img_path}")
+    try:
+        for p in pages:
+            if p < 1 or p > total:
+                print(f"Warning: Page {p} is out of bounds (1..{total}), skipping.")
+                continue
+            page = doc[p - 1]
+            pix = page.get_pixmap(dpi=dpi)
+            img_path = os.path.join(output_dir, f"page_{p:04d}.png")
+            pix.save(img_path)
+            saved_files.append(img_path)
+            print(f"[+] Rendered page {p}/{total} -> {img_path}")
+    finally:
+        doc.close()
 
     return saved_files
 
@@ -138,10 +73,14 @@ def parse_page_range(range_str: str, max_pages: int) -> list:
             start_s, end_s = part.split("-", 1)
             start = int(start_s) if start_s else 1
             end = int(end_s) if end_s else max_pages
-            for p in range(start, end + 1):
+            if start > end:
+                start, end = end, start
+            for p in range(max(1, start), min(max_pages, end) + 1):
                 pages.add(p)
         else:
-            pages.add(int(part))
+            p = int(part)
+            if 1 <= p <= max_pages:
+                pages.add(p)
     return sorted(list(pages))
 
 
@@ -185,7 +124,7 @@ def main():
 
     page_spec = "1"
     if args.chapter:
-        ch_title, start_p, end_p = find_pdf_chapter_range(doc, args.chapter)
+        ch_title, start_p, end_p = find_pdf_chapter_range(doc, args.chapter, pdf_path=args.pdf_path)
         if start_p is None:
             print(f"Error: Could not find chapter matching '{args.chapter}' in TOC.")
             doc.close()
@@ -200,7 +139,7 @@ def main():
         if any(c.isdigit() for c in pos_val) and ("-" in pos_val or "," in pos_val or pos_val.isdigit()):
             page_spec = pos_val
         else:
-            ch_title, start_p, end_p = find_pdf_chapter_range(doc, pos_val)
+            ch_title, start_p, end_p = find_pdf_chapter_range(doc, pos_val, pdf_path=args.pdf_path)
             if start_p is not None:
                 print(f"[*] Matched Chapter from positional arg: {ch_title} -> Pages {start_p}-{end_p}")
                 page_spec = f"{start_p}-{end_p}"

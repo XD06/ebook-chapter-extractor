@@ -16,113 +16,12 @@ import console_safe  # noqa: F401  # 安装窄编码控制台保护（含非 GBK
 from env_checker import ensure_core_dependencies
 ensure_core_dependencies()
 
-try:
-    import pymupdf
-except ImportError:
-    try:
-        import fitz as pymupdf
-    except ImportError:
-        pymupdf = None
+from pdf_helper import detect_ebook_format, probe_pdf_document
 
 
 def probe_pdf(pdf_path: str) -> dict:
-    """PDF 专用探针逻辑（完全保持原有实现）"""
-    if pymupdf is None:
-        return {"error": "PyMuPDF not installed. Run: pip install pymupdf"}
-
-    if not os.path.exists(pdf_path):
-        return {"error": f"File not found: {pdf_path}"}
-
-    try:
-        doc = pymupdf.open(pdf_path)
-    except Exception as e:
-        return {"error": f"Failed to open PDF: {str(e)}"}
-
-    total_pages = doc.page_count
-    meta = doc.metadata or {}
-    toc = doc.get_toc()
-
-    # 采样前 5 页和第 10 页（若有）文本
-    sample_indices = list(range(min(5, total_pages)))
-    if total_pages > 10:
-        sample_indices.append(9)
-
-    char_counts = [len(doc[i].get_text().strip()) for i in sample_indices]
-    avg_chars = sum(char_counts) / len(char_counts) if char_counts else 0
-    is_digital = avg_chars > 30
-
-    # 判断分类
-    has_toc = len(toc) > 0
-
-    # 检测前置印刷目录页（与 build_index.build_from_text_toc 的判定保持一致）
-    has_text_toc = False
-    for i in range(min(20, total_pages)):
-        t = doc[i].get_text()
-        if "目录" in t or "Contents" in t or "TABLE OF CONTENTS" in t.upper():
-            has_text_toc = True
-            break
-
-    paper_headings = []
-    # 只对「数字版 + 无书签」触发布局分析；扫描件无文字层，应走 OCR 路线
-    if is_digital and not has_toc:
-        from paper_parser import detect_headings
-        paper_headings = detect_headings(pdf_path)
-
-    from paper_parser import classify_document
-    doc_class = (classify_document(doc) if is_digital else
-                 {"doc_type": "unknown", "is_two_column": False, "has_abstract": False})
-
-    if is_digital and has_toc:
-        category = "A (Digital + Has TOC)"
-        recommendation = "PyMuPDF / MarkItDown on physical pages directly (No offset needed)"
-    elif is_digital and has_text_toc:
-        category = "B1 (Digital + Printed TOC, No Bookmarks)"
-        recommendation = ("build_index.py first: extract printed TOC -> compute Offset -> PyMuPDF; "
-                          f"layout Paper Mode ({len(paper_headings)} headings) as fallback via --force-layout")
-    elif is_digital and not has_toc:
-        category = "B2 (Digital + No TOC - Paper Mode)"
-        col_hint = " Two-column detected: prefer --column-aware / visual read." if doc_class["is_two_column"] else ""
-        recommendation = (f"Paper Mode: {len(paper_headings)} virtual headings from layout analysis. "
-                          f"Use --chapter <heading> or --range <start-end>.{col_hint}")
-    elif not is_digital and has_toc:
-        category = "C (Scanned + Has TOC)"
-        recommendation = "Slice target pages -> mineru-open-api extract --model vlm (Token优先; 无Token才flash-extract, <=20 pages)"
-    else:
-        category = "D (Scanned + No TOC)"
-        recommendation = "OCR TOC pages -> detect chapter title / calibrate page footer -> MinerU extract --model vlm (Token优先)"
-
-    # 提取精简目录样本（有书签用书签，否则用布局分析虚拟标题）
-    toc_sample = []
-    source_list = toc if has_toc else paper_headings
-    for item in source_list[:10]:
-        toc_sample.append({
-            "level": item[0] if has_toc else 1,
-            "title": item[1] if has_toc else item["title"],
-            "page": item[2] if has_toc else item["phys"]
-        })
-
-    result = {
-        "file": os.path.basename(pdf_path),
-        "path": os.path.abspath(pdf_path),
-        "format": "PDF",
-        "total_pages": total_pages,
-        "is_digital": is_digital,
-        "has_toc": has_toc,
-        "has_text_toc": has_text_toc,
-        "toc_count": len(toc),
-        "category": category,
-        "recommendation": recommendation,
-        "doc_type": doc_class["doc_type"],
-        "is_two_column": doc_class["is_two_column"],
-        "virtual_heading_count": len(paper_headings),
-        "paper_mode": bool(is_digital and not has_toc and not has_text_toc and paper_headings),
-        "toc_sample": toc_sample,
-        "sample_char_counts": char_counts,
-        "title": meta.get("title", ""),
-        "author": meta.get("author", "")
-    }
-    doc.close()
-    return result
+    """PDF 专用探针逻辑"""
+    return probe_pdf_document(pdf_path)
 
 
 def probe_epub(epub_path: str) -> dict:
@@ -146,17 +45,16 @@ def probe_mobi(mobi_path: str) -> dict:
 
 
 def probe_file(file_path: str) -> dict:
-    """通用电子书探针分发器"""
+    """通用电子书探针分发器（魔数优先 + 扩展名兜底）"""
     if not os.path.exists(file_path):
         return {"error": f"File not found: {file_path}"}
 
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext == ".epub":
+    fmt = detect_ebook_format(file_path)
+    if fmt == "epub":
         return probe_epub(file_path)
-    elif ext in (".mobi", ".azw", ".azw3", ".prc"):
+    elif fmt == "mobi":
         return probe_mobi(file_path)
     else:
-        # 默认作为 PDF 解析（保持原有行为）
         return probe_pdf(file_path)
 
 

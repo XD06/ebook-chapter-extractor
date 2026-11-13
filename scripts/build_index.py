@@ -18,53 +18,18 @@ import console_safe  # noqa: F401  # 安装窄编码控制台保护（含非 GBK
 from env_checker import ensure_core_dependencies
 ensure_core_dependencies()
 from ocr_helper import get_cache_dir
+from pdf_helper import (
+    detect_ebook_format,
+    heal_toc_entries,
+    build_index_from_toc_entries,
+    build_index_from_text_toc,
+    build_pdf_index_data,
+)
 
-try:
-    import pymupdf
-except ImportError:
-    try:
-        import fitz as pymupdf
-    except ImportError:
-        pymupdf = None
 
-
-def heal_toc(toc: list, total_pages: int) -> list:
-    """
-    自愈/清洗书签列表（PDF 专用）：
-    1. 修正 <= 0 的异常书签（向后/向下查找首个有效子节点页码提升修复）；
-    2. 过滤完全无效的前置项；
-    3. 保证页码在 [1, total_pages] 合法范围内。
-    """
-    if not toc:
-        return []
-
-    cleaned = []
-    for item in toc:
-        level, title, page = item[0], item[1].strip(), item[2]
-        cleaned.append({"level": level, "title": title, "phys": page})
-
-    # 第一遍：向前/向后回溯修复 <= 0 的异常页码
-    for i in range(len(cleaned)):
-        if cleaned[i]["phys"] <= 0:
-            current_level = cleaned[i]["level"]
-            # 向下寻找第一个属于它的子节点（level > current_level 且 phys > 0）
-            found = False
-            for j in range(i + 1, len(cleaned)):
-                if cleaned[j]["level"] <= current_level:
-                    # 已经到了同级或更高级标题，停止
-                    break
-                if cleaned[j]["phys"] > 0:
-                    cleaned[i]["phys"] = cleaned[j]["phys"]
-                    found = True
-                    break
-
-            # 若仍未找到，尝试看下一条有效的项
-            if not found and i + 1 < len(cleaned) and cleaned[i+1]["phys"] > 0:
-                cleaned[i]["phys"] = cleaned[i+1]["phys"]
-
-    # 第二遍：过滤依然 <= 0 的无意义前置项（如空书签、封面异常等）
-    valid_toc = [item for item in cleaned if 1 <= item["phys"] <= total_pages]
-    return valid_toc
+def heal_toc(toc: list, total_pages: int, doc=None) -> list:
+    """自愈/清洗书签列表（PDF 专用）"""
+    return heal_toc_entries(toc, total_pages, doc=doc)
 
 
 def build_from_toc(doc) -> list:
@@ -72,136 +37,19 @@ def build_from_toc(doc) -> list:
     raw_toc = doc.get_toc()
     if not raw_toc:
         return []
-
-    healed = heal_toc(raw_toc, doc.page_count)
-    if not healed:
-        return []
-
-    total_pages = doc.page_count
-    index = []
-
-    for i, item in enumerate(healed):
-        level, title, start_page = item["level"], item["title"], item["phys"]
-        end_page = total_pages
-
-        # 寻找同级或更高级标题作为本节结束点
-        for nxt in healed[i + 1:]:
-            if nxt["level"] <= level and nxt["phys"] >= start_page:
-                end_page = max(start_page, nxt["phys"] - 1)
-                break
-
-        index.append({
-            "index": i + 1,
-            "level": level,
-            "title": title,
-            "start_phys": start_page,
-            "end_phys": end_page,
-            "page_count": end_page - start_page + 1
-        })
-
-    return index
+    healed = heal_toc(raw_toc, doc.page_count, doc=doc)
+    return build_index_from_toc_entries(healed, doc.page_count)
 
 
-def build_from_text_toc(doc, max_scan_pages: int = 20) -> list:
-    """PDF 专用：无书签时，从前置文本目录提取并计算 Offset"""
-    total = doc.page_count
-    toc_pages = []
-
-    for i in range(min(max_scan_pages, total)):
-        text = doc[i].get_text()
-        if "目录" in text or "Contents" in text or "TABLE OF CONTENTS" in text.upper():
-            toc_pages.append(i)
-
-    if not toc_pages:
-        return []
-
-    # 提取逻辑页码模式
-    extracted = []
-    for pno in toc_pages:
-        lines = doc[pno].get_text().splitlines()
-        for line in lines:
-            line = line.strip()
-            # 匹配 标题 ..... 123
-            m = re.match(r"^(.+?)[.．·\s]{2,}(\d+)\s*$", line)
-            if m:
-                t, logical_p = m.group(1).strip(), int(m.group(2))
-                if len(t) >= 2 and not t.isdigit():
-                    extracted.append((t, logical_p))
-
-    if not extracted:
-        return []
-
-    # 计算 offset: 寻找正文逻辑第1页的物理页
-    offset = 0
-    # 策略1: get_label()
-    for i in range(min(40, total)):
-        if str(doc[i].get_label()).strip() == "1":
-            offset = i
-            break
-
-    # 若无 label，默认根据首个章节提取逻辑值反推（假设首章在目录后几页）
-    if offset == 0 and extracted:
-        first_logical = extracted[0][1]
-        est_phys = (toc_pages[-1] + 1) + 1  # 1-based
-        offset = max(0, est_phys - first_logical)
-
-    index = []
-    for i, (t, log_p) in enumerate(extracted):
-        start_phys = min(total, max(1, log_p + offset))
-        end_phys = total
-        if i + 1 < len(extracted):
-            nxt_phys = min(total, max(1, extracted[i+1][1] + offset))
-            end_phys = max(start_phys, nxt_phys - 1)
-
-        index.append({
-            "index": i + 1,
-            "level": 1,
-            "title": t,
-            "start_phys": start_phys,
-            "end_phys": end_phys,
-            "page_count": end_phys - start_phys + 1   # 修复: 原为未定义的 end_page，命中文本目录即崩溃
-        })
-
-    return index
+def build_from_text_toc(doc, max_scan_pages: int = 20, allow_ocr: bool = True) -> list:
+    """PDF 专用：无书签时，从前置目录提取并计算 Offset"""
+    idx, _ = build_index_from_text_toc(doc, max_scan_pages=max_scan_pages, allow_ocr=allow_ocr)
+    return idx
 
 
-def build_pdf_index(pdf_path: str, force_layout: bool = False) -> dict:
-    """PDF 索引统一入口：书签 -> 文本目录 -> 布局分析虚拟索引 (Paper Mode) 三级回退"""
-    if pymupdf is None:
-        raise RuntimeError("PyMuPDF is required for PDF indexing. Run: pip install pymupdf")
-
-    doc = pymupdf.open(pdf_path)
-    try:
-        if force_layout:
-            from paper_parser import build_virtual_index
-            index = build_virtual_index(pdf_path)
-            source = "layout analysis (paper mode, forced)"
-        else:
-            index = build_from_toc(doc)
-            source = "bookmarks (healed get_toc)"
-
-            if not index:
-                index = build_from_text_toc(doc)
-                source = "extracted text TOC + offset"
-
-            if not index:
-                from paper_parser import build_virtual_index
-                index = build_virtual_index(pdf_path)
-                source = "layout analysis (paper mode)"
-
-        if not index:
-            source = "none (no TOC, bookmarks or layout headings found)"
-
-        return {
-            "file_path": pdf_path,
-            "format": "PDF",
-            "total_pages": doc.page_count,
-            "source": source,
-            "is_virtual": source.startswith("layout"),
-            "chapters": index
-        }
-    finally:
-        doc.close()
+def build_pdf_index(pdf_path: str, allow_ocr_toc: bool = True, force_layout: bool = False) -> dict:
+    """PDF 索引统一入口：书签自愈 -> 印刷/扫描目录 -> 布局分析虚拟索引 三级回退"""
+    return build_pdf_index_data(pdf_path, allow_ocr_toc=allow_ocr_toc, force_layout=force_layout)
 
 
 def build_epub_index(epub_path: str) -> dict:
@@ -239,6 +87,7 @@ def main():
     parser.add_argument("--output", "-o", default=None, help="Output JSON path (default: .cache/<file_stem>_chapters.json)")
     parser.add_argument("--print", "-p", action="store_true", help="Print table to stdout")
     parser.add_argument("--force-layout", action="store_true", help="Force layout-based virtual index (Paper Mode) even if bookmarks exist")
+    parser.add_argument("--no-ocr-toc", action="store_true", help="Skip OCR scanning of front pages for scanned PDFs")
     args = parser.parse_args()
 
     file_path = os.path.abspath(args.file_path)
@@ -246,14 +95,17 @@ def main():
         print(f"Error: File not found: {file_path}")
         sys.exit(1)
 
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext == ".epub":
+    fmt = detect_ebook_format(file_path)
+    if fmt == "epub":
         result = build_epub_index(file_path)
-    elif ext in (".mobi", ".azw", ".azw3", ".prc"):
+    elif fmt == "mobi":
         result = build_mobi_index(file_path)
     else:
-        # 默认作为 PDF 解析
-        result = build_pdf_index(file_path, force_layout=args.force_layout)
+        result = build_pdf_index(
+            file_path,
+            allow_ocr_toc=not args.no_ocr_toc,
+            force_layout=args.force_layout,
+        )
 
     chapters = result.get("chapters", [])
 

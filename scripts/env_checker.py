@@ -8,7 +8,7 @@ env_checker.py - 依赖自动检测与自愈安装工具
 import sys
 import os
 import subprocess
-import importlib
+import importlib.util
 
 # 依赖分级定义
 DEPENDENCY_TIERS = {
@@ -32,11 +32,14 @@ PIP_INDEX_URLS = [
 
 
 def is_installed(module_name: str) -> bool:
-    """检测指定 Python 模块是否已安装"""
+    """快速检测指定 Python 模块是否已安装（仅探测 spec，避免启动时全量导包开销）"""
     try:
-        importlib.import_module(module_name)
-        return True
-    except ImportError:
+        if importlib.util.find_spec(module_name) is not None:
+            return True
+        if module_name == "pymupdf":
+            return importlib.util.find_spec("fitz") is not None
+        return False
+    except (ImportError, ValueError, AttributeError):
         return False
 
 
