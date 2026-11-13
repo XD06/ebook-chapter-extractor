@@ -9,15 +9,17 @@ import os
 import sys
 import re
 import json
+import posixpath
 import zipfile
 import xml.etree.ElementTree as ET
 from urllib.parse import unquote, urldefrag
 from typing import List, Dict, Tuple, Optional, Any
 
 try:
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, Comment
 except ImportError:
     BeautifulSoup = None
+    Comment = None
 
 try:
     import markdownify
@@ -33,21 +35,46 @@ from ocr_helper import detect_image_ext, ocr_image, ocr_images_batch, format_ocr
 from mathml_helper import convert_soup_mathml_to_latex
 
 
+def _decode_bytes(raw: bytes, fallback_encoding: str = "utf-8") -> str:
+    """结合 BOM 与 XML/HTML 声明编码智能解码文本，兼容 UTF-16 与非 UTF-8 EPUB"""
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", errors="replace")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig", errors="replace")
+    head = raw[:512].decode("ascii", errors="ignore")
+    m = re.search(r'(?:encoding|charset)\s*=\s*["\']?\s*([A-Za-z0-9_\-]+)', head, re.I)
+    enc = m.group(1) if m else fallback_encoding
+    try:
+        return raw.decode(enc, errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
+
+
 def purge_useless_navigation(soup: BeautifulSoup) -> None:
-    """清理 DOM 中无意义的导航、页眉页脚与顶底跳转链接，防止稀释 Agent 上下文"""
+    """清理 DOM 中无意义的导航、运行页眉页脚与顶底跳转链接，同时保留含标题或正文的语义 header/footer"""
     if not soup:
         return
     for tag in soup.find_all(["nav", "header", "footer"]):
-        epub_type = tag.get("epub:type", "")
-        classes = " ".join(tag.get("class", []))
-        if "toc" in epub_type or "nav" in classes or "pagination" in classes or tag.name in ("header", "footer"):
+        epub_type = str(tag.get("epub:type", "") or "").lower()
+        classes = " ".join(tag.get("class", []) or []).lower()
+        if tag.name == "nav":
+            if "toc" in epub_type or "nav" in classes or "pagination" in classes or "landmarks" in epub_type:
+                tag.decompose()
+                continue
+        if "pagination" in classes or "running" in classes or "page-header" in classes or "page-footer" in classes:
+            tag.decompose()
+            continue
+        if tag.name in ("header", "footer"):
+            # 若 header/footer 内部包含章节标题 h1-h3 或较长正文，说明它是语义结构而非页眉页脚
+            if tag.find(["h1", "h2", "h3"]) or len(tag.get_text(" ", strip=True)) >= 120:
+                continue
             tag.decompose()
 
     for a in soup.find_all("a"):
         text = a.get_text().strip().lower()
         if text in ("[top]", "[next]", "[previous]", "[contents]", "[back to top]", "top", "contents"):
             a.decompose()
-        elif not text and not a.find(["img", "image"]):
+        elif not text and not a.find(["img", "image"]) and not (a.get("id") or a.get("name")):
             a.decompose()
 
 
@@ -69,35 +96,36 @@ def _strip_ns(tag: str) -> str:
     return tag
 
 
-def enhance_pre_code_tags(soup: BeautifulSoup) -> None:
+def enhance_pre_code_tags(soup: BeautifulSoup, code_placeholders: Optional[Dict[str, str]] = None) -> None:
     """
     预处理 HTML 中的代码块结构 (<pre>, <code>, <tt>, 以及等宽字体、类名标有 code/program/listing 的元素)，
-    将其规范化为标准的 fenced code block 格式，防止被 markdown 转换器错误折行或退化为普通文本。
+    借助占位符机制脱离 <pre> 包装，彻底避免 html2text 在围栏代码块前追加 4 空格导致退化为缩进块。
     """
     if not soup:
         return
 
     def detect_lang(classes: list, text: str) -> str:
         c_str = " ".join(classes).lower()
+        tokens = re.split(r"[\s_\-]+", c_str)
         if "cpp" in c_str or "c++" in c_str:
             return "cpp"
-        if "golang" in c_str or "go" in c_str.split():
+        if "golang" in c_str or "go" in tokens:
             return "go"
-        if "python" in c_str or "py" in c_str.split():
+        if "python" in c_str or "py" in tokens:
             return "python"
-        if "java" in c_str.split():
+        if "java" in tokens:
             return "java"
-        if "rust" in c_str.split() or "rs" in c_str.split():
+        if "rust" in tokens or "rs" in tokens:
             return "rust"
-        if "javascript" in c_str or "js" in c_str.split() or "typescript" in c_str or "ts" in c_str.split():
+        if "javascript" in c_str or "js" in tokens or "typescript" in c_str or "ts" in tokens:
             return "javascript"
-        if "bash" in c_str or "sh" in c_str.split() or "shell" in c_str:
+        if "bash" in c_str or "sh" in tokens or "shell" in c_str:
             return "bash"
-        if "sql" in c_str.split():
+        if "sql" in tokens:
             return "sql"
-        if "html" in c_str.split() or "xml" in c_str.split():
+        if "html" in tokens or "xml" in tokens:
             return "html"
-        if "c" in c_str.split():
+        if "c" in tokens:
             return "c"
         if "#include" in text or "std::" in text or "cout <<" in text:
             return "cpp"
@@ -109,45 +137,74 @@ def enhance_pre_code_tags(soup: BeautifulSoup) -> None:
             return "c"
         return ""
 
+    def extract_clean_code_text(tag) -> str:
+        for br in list(tag.find_all("br")):
+            br.replace_with("\n")
+        return tag.get_text().strip("\r\n")
+
+    def replace_with_fenced(tag, lang: str, body: str) -> None:
+        fenced = f"\n```{lang}\n{body}\n```\n"
+        if code_placeholders is not None:
+            ph_key = f"EBOOKCODEBLOCKTOKEN{len(code_placeholders)}END"
+            code_placeholders[ph_key] = fenced
+            p_tag = soup.new_tag("p")
+            p_tag.string = ph_key
+            tag.replace_with(p_tag)
+        else:
+            div_tag = soup.new_tag("div")
+            div_tag.string = fenced
+            tag.replace_with(div_tag)
+
     # 1. 处理标准的 <pre> 块
     for pre in list(soup.find_all("pre")):
+        if not pre.parent:
+            continue
         code_tag = pre.find("code")
-        classes = pre.get("class", [])
+        classes = list(pre.get("class", []) or [])
         if code_tag and code_tag.get("class"):
-            classes = classes + code_tag.get("class", [])
-        code_text = pre.get_text()
+            classes = classes + list(code_tag.get("class", []) or [])
+        code_text = extract_clean_code_text(pre)
+        if not code_text.strip():
+            continue
         lang = detect_lang(classes, code_text)
-        pre.string = f"\n```{lang}\n{code_text.strip()}\n```\n"
+        replace_with_fenced(pre, lang, code_text)
 
     # 2. 处理 class 名带 code / program / listing / monospace 或含有 monospace 样式的 div / p
     code_selectors = ["div", "p"]
     for tag in list(soup.find_all(code_selectors)):
-        if tag.find_parent("pre"):
+        if not tag.parent or tag.find_parent("pre"):
             continue
-        classes = tag.get("class", [])
+        raw_txt = tag.get_text()
+        if "EBOOKCODEBLOCKTOKEN" in raw_txt or tag.find(["h1", "h2", "h3", "h4", "table"]):
+            continue
+        classes = list(tag.get("class", []) or [])
         c_str = " ".join(classes).lower()
         style = (tag.get("style") or "").lower()
 
-        is_code_container = any(kw in c_str for kw in ["code", "program", "listing", "syntax", "snippet", "monospace"]) or \
-                            any(kw in style for kw in ["monospace", "courier", "consolas", "menlo"])
+        is_code_container = bool(
+            re.search(r"(?:^|[^a-z])(code|codeblock|program|listing|syntax|snippet|monospace|sourcecode)", c_str)
+        ) or any(kw in style for kw in ["monospace", "courier", "consolas", "menlo"])
 
         if is_code_container:
-            code_text = tag.get_text()
+            code_text = extract_clean_code_text(tag)
             if code_text.strip() and (len(code_text.splitlines()) >= 2 or any(kw in code_text for kw in [";", "{", "}", "()", "def ", "func ", "int ", "#include"])):
                 lang = detect_lang(classes, code_text)
-                tag.string = f"\n```{lang}\n{code_text.strip()}\n```\n"
+                replace_with_fenced(tag, lang, code_text)
 
     # 3. 处理 <font face="monospace|Courier|Consolas"> 或多行 <tt>
     for font_or_tt in list(soup.find_all(["font", "tt"])):
-        if font_or_tt.find_parent("pre"):
+        if not font_or_tt.parent or font_or_tt.find_parent("pre"):
+            continue
+        raw_txt = font_or_tt.get_text()
+        if "EBOOKCODEBLOCKTOKEN" in raw_txt:
             continue
         face = (font_or_tt.get("face") or "").lower()
         is_mono = font_or_tt.name == "tt" or any(kw in face for kw in ["monospace", "courier", "consolas"])
         if is_mono:
-            text = font_or_tt.get_text()
-            if len(text.splitlines()) >= 2 or len(text.strip()) > 80:
+            text = extract_clean_code_text(font_or_tt)
+            if text.strip() and (len(text.splitlines()) >= 2 or len(text.strip()) > 80):
                 lang = detect_lang([], text)
-                font_or_tt.string = f"\n```{lang}\n{text.strip()}\n```\n"
+                replace_with_fenced(font_or_tt, lang, text)
 
 
 class EpubBook:
@@ -159,8 +216,11 @@ class EpubBook:
             raise FileNotFoundError(f"EPUB file not found: {self.epub_path}")
 
         self.zip_file = zipfile.ZipFile(self.epub_path, "r")
+        self._namelist_lower = {name.lower(): name for name in self.zip_file.namelist()}
+        self.opf_dir = ""
+        self.is_drm_protected, self.drm_reason, self.drm_encrypted_uris = self._detect_drm()
         self.opf_path = self._find_opf_path()
-        self.opf_dir = os.path.dirname(self.opf_path)
+        self.opf_dir = posixpath.dirname(self.opf_path.replace("\\", "/"))
         self.metadata, self.manifest, self.spine = self._parse_opf()
         self.toc = self._parse_toc()
 
@@ -174,29 +234,75 @@ class EpubBook:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-    def _read_file_text(self, internal_path: str, encoding: str = "utf-8") -> str:
-        """从 zip 中读取文本文件内容"""
-        norm_path = internal_path.replace("\\", "/").lstrip("/")
+    def _detect_drm(self) -> Tuple[bool, str, set]:
+        """检测 EPUB 是否受 DRM 加密保护（排除仅使用字体混淆 IDPF/Adobe font obfuscation 的合法文件）"""
+        encrypted_uris = set()
+        for drm_marker in ("meta-inf/rights.xml",):
+            if drm_marker in self._namelist_lower:
+                return True, f"DRM rights file detected ({drm_marker})", encrypted_uris
+        if any(n.endswith(".lcpl") for n in self._namelist_lower):
+            return True, "Readium LCP DRM license detected", encrypted_uris
+
+        enc_path = self._namelist_lower.get("meta-inf/encryption.xml")
+        if not enc_path:
+            return False, "", encrypted_uris
+
         try:
-            raw = self.zip_file.read(norm_path)
-            return raw.decode(encoding, errors="replace")
-        except KeyError:
-            for name in self.zip_file.namelist():
-                if name.lower() == norm_path.lower():
-                    raw = self.zip_file.read(name)
-                    return raw.decode(encoding, errors="replace")
-            raise FileNotFoundError(f"Path '{internal_path}' not found in EPUB archive.")
+            enc_xml = _decode_bytes(self.zip_file.read(enc_path))
+            root = ET.fromstring(enc_xml)
+        except Exception:
+            return True, "Unreadable META-INF/encryption.xml", encrypted_uris
+
+        drm_detected = False
+        reason = ""
+        font_exts = (".ttf", ".otf", ".woff", ".woff2", ".eot")
+        for elem in root.iter():
+            if _strip_ns(elem.tag) != "EncryptedData":
+                continue
+            alg = ""
+            uri = ""
+            for sub in elem.iter():
+                sname = _strip_ns(sub.tag)
+                if sname == "EncryptionMethod":
+                    alg = (sub.get("Algorithm") or "").strip()
+                elif sname == "CipherReference":
+                    uri = unquote(sub.get("URI") or "").strip().replace("\\", "/").lstrip("/")
+
+            alg_lower = alg.lower()
+            is_font_obfuscation = (
+                "2008/embedding" in alg_lower
+                or "enc#embedded" in alg_lower
+                or (uri.lower().endswith(font_exts) and not alg_lower.endswith("aes128-cbc"))
+            )
+            if not is_font_obfuscation:
+                drm_detected = True
+                if uri:
+                    encrypted_uris.add(posixpath.normpath(uri).lower())
+                if not reason:
+                    reason = alg or "Encrypted content in META-INF/encryption.xml"
+
+        return drm_detected, reason, encrypted_uris
+
+    def _read_file_text(self, internal_path: str, encoding: str = "utf-8") -> str:
+        """从 zip 中读取并智能解码文本文件内容"""
+        raw = self._read_file_bytes(internal_path)
+        return _decode_bytes(raw, fallback_encoding=encoding)
 
     def _read_file_bytes(self, internal_path: str) -> bytes:
-        """从 zip 中读取二进制内容"""
-        norm_path = internal_path.replace("\\", "/").lstrip("/")
-        try:
-            return self.zip_file.read(norm_path)
-        except KeyError:
-            for name in self.zip_file.namelist():
-                if name.lower() == norm_path.lower():
-                    return self.zip_file.read(name)
-            raise FileNotFoundError(f"Path '{internal_path}' not found in EPUB archive.")
+        """从 zip 中读取二进制内容（O(1) 路径标准化 + OPF 目录兜底）"""
+        clean = unquote(internal_path).replace("\\", "/").lstrip("/")
+        norm_path = posixpath.normpath(clean)
+        candidates = [norm_path]
+        if self.opf_dir and not norm_path.startswith(self.opf_dir + "/"):
+            candidates.append(posixpath.normpath(f"{self.opf_dir}/{norm_path}"))
+        for cand in candidates:
+            try:
+                return self.zip_file.read(cand)
+            except KeyError:
+                actual = self._namelist_lower.get(cand.lower())
+                if actual:
+                    return self.zip_file.read(actual)
+        raise FileNotFoundError(f"Path '{internal_path}' not found in EPUB archive.")
 
     def _find_opf_path(self) -> str:
         """从 META-INF/container.xml 定位 content.opf 路径"""
@@ -317,7 +423,9 @@ class EpubBook:
         def parse_navpoint(elem, level=1):
             title = ""
             for lbl in elem.findall("{http://www.daisy.org/z3986/2005/ncx/}navLabel") or elem.findall("navLabel"):
-                txt = lbl.find("{http://www.daisy.org/z3986/2005/ncx/}text") or lbl.find("text")
+                txt = lbl.find("{http://www.daisy.org/z3986/2005/ncx/}text")
+                if txt is None:
+                    txt = lbl.find("text")
                 if txt is not None and txt.text:
                     title = txt.text.strip()
                     break
@@ -451,15 +559,22 @@ class EpubBook:
             "file": os.path.basename(self.epub_path),
             "path": self.epub_path,
             "format": "EPUB",
-            "is_digital": True,
+            "is_digital": not self.is_drm_protected,
+            "is_drm": self.is_drm_protected,
+            "drm_info": self.drm_reason if self.is_drm_protected else "",
             "title": self.metadata.get("title", ""),
             "author": self.metadata.get("author", ""),
+            "publisher": self.metadata.get("publisher", ""),
             "language": self.metadata.get("language", ""),
             "total_spine_items": len(self.spine),
             "has_toc": len(self.toc) > 0,
             "toc_count": len(self.toc),
-            "category": "E (Reflowable EPUB)",
-            "recommendation": "Pure Python zip+xhtml parse -> Native HTML to Markdown (0.05s, 0 Token, 100% precision)",
+            "category": "DRM-Protected EPUB" if self.is_drm_protected else "E (Reflowable EPUB)",
+            "recommendation": (
+                f"DRM detected ({self.drm_reason}); remove DRM before extraction."
+                if self.is_drm_protected
+                else "Pure Python zip+xhtml parse -> Native HTML to Markdown (0.05s, 0 Token, 100% precision)"
+            ),
             "toc_sample": [
                 {"index": item["index"], "level": item["level"], "title": item["title"], "src": item.get("src", "")}
                 for item in self.toc[:10]
@@ -494,82 +609,244 @@ class EpubBook:
 
         return None
 
-    def extract_chapter_html(self, chapter_info: Dict[str, Any]) -> str:
-        """提取目标章节的原始 HTML 片段"""
-        file_path = chapter_info["file_path"]
-        anchor = chapter_info.get("anchor")
+    def _ensure_not_drm_locked(self, file_path: str) -> None:
+        if not self.is_drm_protected:
+            return
+        norm_fp = posixpath.normpath(file_path.replace("\\", "/").lstrip("/")).lower()
+        if not self.drm_encrypted_uris or norm_fp in self.drm_encrypted_uris:
+            raise RuntimeError(f"EPUB content '{file_path}' is protected by DRM ({self.drm_reason}) and cannot be extracted.")
 
-        full_html = self._read_file_text(file_path)
-        if not anchor or not BeautifulSoup:
+    def _resolve_internal_path(self, base_file: str, rel_src: str) -> str:
+        clean = unquote(rel_src).split("?")[0].split("#")[0].replace("\\", "/")
+        if clean.startswith("/"):
+            return posixpath.normpath(clean.lstrip("/"))
+        base_dir = posixpath.dirname(base_file.replace("\\", "/"))
+        if base_dir:
+            return posixpath.normpath(f"{base_dir}/{clean}")
+        return posixpath.normpath(clean)
+
+    def _get_chapter_segments(self, chapter_info: Dict[str, Any]) -> List[Tuple[str, Optional[str], Optional[str]]]:
+        """计算目标章节跨越的 (file_path, start_anchor, stop_anchor) 片段列表"""
+        start_file = chapter_info["file_path"]
+        start_anchor = chapter_info.get("anchor")
+        cur_level = chapter_info.get("level", 1)
+
+        cur_idx = None
+        ch_index = chapter_info.get("index")
+        if ch_index is not None:
+            for idx, item in enumerate(self.toc):
+                if item.get("index") == ch_index:
+                    cur_idx = idx
+                    break
+        if cur_idx is None:
+            for idx, item in enumerate(self.toc):
+                if (
+                    item.get("file_path") == start_file
+                    and item.get("anchor") == start_anchor
+                    and item.get("title") == chapter_info.get("title")
+                ):
+                    cur_idx = idx
+                    break
+
+        stop_entry = None
+        if cur_idx is not None:
+            for nxt in self.toc[cur_idx + 1:]:
+                if nxt.get("file_path") == start_file and nxt.get("anchor") == start_anchor:
+                    continue
+                if nxt.get("level", 1) <= cur_level:
+                    stop_entry = nxt
+                    break
+
+        if stop_entry and stop_entry["file_path"] == start_file:
+            if stop_entry.get("anchor") and stop_entry.get("anchor") != start_anchor:
+                return [(start_file, start_anchor, stop_entry.get("anchor"))]
+            return [(start_file, start_anchor, None)]
+
+        spine_paths = [
+            self.manifest[idref]["full_path"]
+            for idref in self.spine
+            if idref in self.manifest and self.manifest[idref].get("full_path")
+        ]
+        s_idx = None
+        for idx, sp in enumerate(spine_paths):
+            if sp.lower() == start_file.lower():
+                s_idx = idx
+                break
+
+        if s_idx is None:
+            return [(start_file, start_anchor, None)]
+
+        if stop_entry is None:
+            segments = [(start_file, start_anchor, None)]
+            segments.extend((sp, None, None) for sp in spine_paths[s_idx + 1:])
+            return segments
+
+        stop_file = stop_entry["file_path"]
+        stop_anchor = stop_entry.get("anchor")
+        e_idx = None
+        for idx in range(s_idx + 1, len(spine_paths)):
+            if spine_paths[idx].lower() == stop_file.lower():
+                e_idx = idx
+                break
+
+        if e_idx is None:
+            return [(start_file, start_anchor, None)]
+
+        segments = [(start_file, start_anchor, None)]
+        segments.extend((sp, None, None) for sp in spine_paths[s_idx + 1 : e_idx])
+        if stop_anchor:
+            segments.append((stop_file, None, stop_anchor))
+        return segments
+
+    def _slice_html_by_anchors(self, full_html: str, start_anchor: Optional[str], stop_anchor: Optional[str]) -> str:
+        """在同一 HTML 文档中精准截取 [start_anchor, stop_anchor) 之间的正文片段"""
+        if not start_anchor and not stop_anchor:
+            return full_html
+        if not BeautifulSoup or Comment is None:
             return full_html
 
         soup = BeautifulSoup(full_html, "html.parser")
-        target_elem = soup.find(id=anchor) or soup.find(attrs={"name": anchor})
-        if target_elem:
-            if target_elem.name in ("section", "div", "article", "chapter"):
-                return str(target_elem)
+        body = soup.find("body") or soup
+
+        def find_el(anchor: Optional[str]):
+            if not anchor:
+                return None
+            return body.find(id=anchor) or body.find(attrs={"name": anchor})
+
+        def lift_target(el):
+            cur = el
+            while (
+                cur is not None
+                and cur.parent is not None
+                and cur.name in ("a", "span")
+                and not cur.get_text(strip=True)
+                and cur.parent.name in ("h1", "h2", "h3", "h4", "h5", "h6")
+            ):
+                cur = cur.parent
+            return cur
+
+        start_el = find_el(start_anchor)
+        stop_el = find_el(stop_anchor)
+
+        if start_anchor and start_el is None:
             return full_html
 
-        return full_html
+        if stop_el is None and start_el is not None and start_el.name in ("section", "article", "chapter") and len(start_el.get_text(strip=True)) >= 40:
+            return str(start_el)
+
+        start_marker = "__EBOOK_SLICE_START_MARKER__"
+        stop_marker = "__EBOOK_SLICE_STOP_MARKER__"
+
+        if start_el is not None:
+            lift_target(start_el).insert_before(Comment(start_marker))
+        if stop_el is not None:
+            lift_target(stop_el).insert_before(Comment(stop_marker))
+
+        raw_body = body.decode_contents() if hasattr(body, "decode_contents") else str(body)
+        start_token = f"<!--{start_marker}-->"
+        stop_token = f"<!--{stop_marker}-->"
+
+        s_pos = 0
+        if start_el is not None:
+            found_s = raw_body.find(start_token)
+            if found_s == -1:
+                return full_html
+            s_pos = found_s + len(start_token)
+
+        e_pos = len(raw_body)
+        if stop_el is not None:
+            found_e = raw_body.find(stop_token)
+            if found_e != -1:
+                if found_e < s_pos:
+                    return full_html
+                e_pos = found_e
+
+        fragment = raw_body[s_pos:e_pos].strip()
+        if not fragment:
+            return ""
+        frag_soup = BeautifulSoup(fragment, "html.parser")
+        if not frag_soup.get_text(strip=True) and not frag_soup.find(["img", "image"]):
+            return ""
+        return fragment
+
+    def _get_chapter_html_fragments(self, chapter_info: Dict[str, Any]) -> List[Tuple[str, str]]:
+        """获取目标章节拆分后的 (file_path, html_fragment) 列表"""
+        segments = self._get_chapter_segments(chapter_info)
+        fragments = []
+        for file_path, s_anchor, e_anchor in segments:
+            self._ensure_not_drm_locked(file_path)
+            full_html = self._read_file_text(file_path)
+            sliced = self._slice_html_by_anchors(full_html, s_anchor, e_anchor)
+            if sliced and sliced.strip():
+                fragments.append((file_path, sliced))
+        return fragments
+
+    def extract_chapter_html(self, chapter_info: Dict[str, Any]) -> str:
+        """提取目标章节的原始 HTML 片段（支持单文件锚点精切与跨 Spine 文件合并）"""
+        fragments = self._get_chapter_html_fragments(chapter_info)
+        if not fragments:
+            file_path = chapter_info["file_path"]
+            self._ensure_not_drm_locked(file_path)
+            return self._read_file_text(file_path)
+        return "\n".join(frag for _, frag in fragments)
 
     def extract_chapter_images(self, chapter_info: Dict[str, Any], output_dir: Optional[str] = None) -> List[Dict[str, Any]]:
-        """提取目标章节关联的所有图片"""
-        file_path = chapter_info["file_path"]
-        ch_dir = os.path.dirname(file_path)
-        full_html = self._read_file_text(file_path)
+        """提取目标章节关联的所有图片（按真实片段路径解析相对地址）"""
+        fragments = self._get_chapter_html_fragments(chapter_info)
+        if not fragments:
+            fragments = [(chapter_info["file_path"], self.extract_chapter_html(chapter_info))]
 
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
         extracted = []
-        if BeautifulSoup:
-            soup = BeautifulSoup(full_html, "html.parser")
-            imgs = soup.find_all(["img", "image"])
-        else:
-            imgs = []
-            for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', full_html, re.I):
-                imgs.append({"src": m.group(1), "alt": ""})
+        img_counter = 0
+        ch_num = chapter_info.get("index", 1)
 
-        for i, img_tag in enumerate(imgs):
-            if hasattr(img_tag, "get"):
-                src = img_tag.get("src") or img_tag.get("xlink:href")
-                alt = img_tag.get("alt", "")
+        for frag_file, frag_html in fragments:
+            if BeautifulSoup:
+                soup = BeautifulSoup(frag_html, "html.parser")
+                imgs = soup.find_all(["img", "image"])
             else:
-                src = img_tag["src"]
-                alt = img_tag.get("alt", "")
+                imgs = []
+                for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', frag_html, re.I):
+                    imgs.append({"src": m.group(1), "alt": ""})
 
-            if not src:
-                continue
+            for img_tag in imgs:
+                if hasattr(img_tag, "get"):
+                    src = img_tag.get("src") or img_tag.get("xlink:href")
+                    alt = img_tag.get("alt", "")
+                else:
+                    src = img_tag["src"]
+                    alt = img_tag.get("alt", "")
 
-            src_clean = unquote(src).split("?")[0].split("#")[0]
-            if ch_dir:
-                internal_img_path = os.path.normpath(f"{ch_dir}/{src_clean}").replace("\\", "/")
-            else:
-                internal_img_path = os.path.normpath(src_clean).replace("\\", "/")
+                if not src:
+                    continue
 
-            try:
-                img_bytes = self._read_file_bytes(internal_img_path)
-            except Exception:
-                continue
+                internal_img_path = self._resolve_internal_path(frag_file, src)
+                try:
+                    img_bytes = self._read_file_bytes(internal_img_path)
+                except Exception:
+                    continue
 
-            saved_path = None
-            if output_dir:
-                ext = os.path.splitext(internal_img_path)[1]
-                if not ext:
-                    ext = detect_image_ext(img_bytes)
-                ch_num = chapter_info.get("index", 1)
-                img_filename = f"ch{ch_num:03d}_img{i + 1:03d}{ext}"
-                saved_path = os.path.join(output_dir, img_filename)
-                with open(saved_path, "wb") as f:
-                    f.write(img_bytes)
+                img_counter += 1
+                saved_path = None
+                if output_dir:
+                    ext = posixpath.splitext(internal_img_path)[1]
+                    if not ext:
+                        ext = detect_image_ext(img_bytes)
+                    img_filename = f"ch{ch_num:03d}_img{img_counter:03d}{ext}"
+                    saved_path = os.path.join(output_dir, img_filename)
+                    with open(saved_path, "wb") as f:
+                        f.write(img_bytes)
 
-            extracted.append({
-                "index": i + 1,
-                "internal_path": internal_img_path,
-                "saved_path": saved_path,
-                "alt": alt,
-                "bytes": img_bytes,
-            })
+                extracted.append({
+                    "index": img_counter,
+                    "internal_path": internal_img_path,
+                    "saved_path": saved_path,
+                    "alt": alt,
+                    "bytes": img_bytes,
+                })
 
         return extracted
 
@@ -580,66 +857,67 @@ class EpubBook:
         ocr: bool = False,
         ocr_engine: Optional[str] = None,
     ) -> str:
-        """提取目标章节并转换为 Markdown (支持插图导出与 OCR 智能回填)"""
-        html_content = self.extract_chapter_html(chapter_info)
-        file_path = chapter_info["file_path"]
-        ch_dir = os.path.dirname(file_path)
+        """提取目标章节并转换为 Markdown (支持跨文件拼装、围栏代码保真、插图导出与 OCR 智能回填)"""
+        fragments = self._get_chapter_html_fragments(chapter_info)
+        if not fragments:
+            fragments = [(chapter_info["file_path"], self.extract_chapter_html(chapter_info))]
+
         title = chapter_info.get("title", "")
 
         if dump_images_dir:
             os.makedirs(dump_images_dir, exist_ok=True)
 
-        placeholders = {}
-        processed_html = html_content
+        placeholders: Dict[str, str] = {}
+        code_placeholders: Dict[str, str] = {}
+        pending_ocr_tasks = []
+        processed_html_parts = []
+        img_counter = 0
+        ch_num = chapter_info.get("index", 1)
 
         if BeautifulSoup:
-            soup = BeautifulSoup(html_content, "html.parser")
-            purge_useless_navigation(soup)
-            convert_soup_mathml_to_latex(soup)
-            enhance_pre_code_tags(soup)
+            for frag_file, frag_html in fragments:
+                soup = BeautifulSoup(frag_html, "html.parser")
+                purge_useless_navigation(soup)
+                convert_soup_mathml_to_latex(soup)
+                enhance_pre_code_tags(soup, code_placeholders=code_placeholders)
 
-            imgs = soup.find_all(["img", "image"])
-            pending_ocr_tasks = []
+                imgs = soup.find_all(["img", "image"])
+                for img in imgs:
+                    src = img.get("src") or img.get("xlink:href")
+                    alt = img.get("alt", "").strip()
+                    if not src:
+                        continue
 
-            for i, img in enumerate(imgs):
-                src = img.get("src") or img.get("xlink:href")
-                alt = img.get("alt", "").strip()
-                if not src:
-                    continue
+                    internal_img_path = self._resolve_internal_path(frag_file, src)
+                    try:
+                        img_bytes = self._read_file_bytes(internal_img_path)
+                    except Exception:
+                        continue
 
-                src_clean = unquote(src).split("?")[0].split("#")[0]
-                if ch_dir:
-                    internal_img_path = os.path.normpath(f"{ch_dir}/{src_clean}").replace("\\", "/")
-                else:
-                    internal_img_path = os.path.normpath(src_clean).replace("\\", "/")
+                    img_counter += 1
+                    saved_path = None
+                    if dump_images_dir:
+                        ext = posixpath.splitext(internal_img_path)[1]
+                        if not ext:
+                            ext = detect_image_ext(img_bytes)
+                        img_filename = f"ch{ch_num:03d}_img{img_counter:03d}{ext}"
+                        saved_path = os.path.join(dump_images_dir, img_filename)
+                        with open(saved_path, "wb") as f:
+                            f.write(img_bytes)
 
-                try:
-                    img_bytes = self._read_file_bytes(internal_img_path)
-                except Exception:
-                    continue
+                    if ocr:
+                        ph_key = f"EPUBOCRPLACEHOLDERTOKEN{len(pending_ocr_tasks)}END"
+                        pending_ocr_tasks.append((ph_key, alt or f"插图 {img_counter}", saved_path, img_bytes))
+                        p_tag = soup.new_tag("p")
+                        p_tag.string = ph_key
+                        img.replace_with(p_tag)
+                    elif saved_path:
+                        if img.name == "image":
+                            img["xlink:href"] = saved_path
+                        else:
+                            img["src"] = saved_path
 
-                saved_path = None
-                if dump_images_dir:
-                    ext = os.path.splitext(internal_img_path)[1]
-                    if not ext:
-                        ext = detect_image_ext(img_bytes)
-                    ch_num = chapter_info.get("index", 1)
-                    img_filename = f"ch{ch_num:03d}_img{i + 1:03d}{ext}"
-                    saved_path = os.path.join(dump_images_dir, img_filename)
-                    with open(saved_path, "wb") as f:
-                        f.write(img_bytes)
-
-                if ocr:
-                    ph_key = f"__EPUB_OCR_PLACEHOLDER_{i}__"
-                    pending_ocr_tasks.append((ph_key, alt or f"插图 {i + 1}", saved_path, img_bytes))
-                    p_tag = soup.new_tag("p")
-                    p_tag.string = ph_key
-                    img.replace_with(p_tag)
-                elif saved_path:
-                    if img.name == "image":
-                        img["xlink:href"] = saved_path
-                    else:
-                        img["src"] = saved_path
+                processed_html_parts.append(str(soup))
 
             if pending_ocr_tasks:
                 images_to_ocr = [task[3] for task in pending_ocr_tasks]
@@ -647,7 +925,9 @@ class EpubBook:
                 for (ph_key, alt_val, saved_path, _), ocr_text in zip(pending_ocr_tasks, ocr_texts):
                     placeholders[ph_key] = format_ocr_markdown(ocr_text, alt_text=alt_val, image_rel_path=saved_path)
 
-            processed_html = str(soup)
+            processed_html = "\n".join(processed_html_parts)
+        else:
+            processed_html = "\n".join(frag for _, frag in fragments)
 
         if html2text:
             h = html2text.HTML2Text()
@@ -663,10 +943,15 @@ class EpubBook:
         else:
             md = re.sub(r"<[^>]+>", "", processed_html).strip()
 
+        for ph_key, block in code_placeholders.items():
+            md = md.replace(ph_key, f"\n{block.strip()}\n")
+
         for ph_key, block in placeholders.items():
             md = md.replace(ph_key, block)
 
-        if title and not md.startswith("# "):
+        md = re.sub(r"\n{3,}", "\n\n", md).strip()
+
+        if title and not re.match(r"^\s*#\s+", md):
             md = f"# {title}\n\n{md}"
 
         return md

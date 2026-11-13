@@ -7,11 +7,16 @@ mobi_parser.py - MOBI / AZW / AZW3 (KF8) 格式电子书解析与按需提取引
 import os
 import sys
 import re
+import shutil
 import struct
 import tempfile
 import json
 from urllib.parse import unquote, urldefrag
 from typing import List, Dict, Tuple, Optional, Any
+
+_SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
 
 from epub_parser import EpubBook, enhance_pre_code_tags, purge_useless_navigation
 
@@ -69,6 +74,119 @@ def decompress_palmdoc(data: bytes) -> bytes:
     return bytes(out)
 
 
+def _get_trailing_data_size(record: bytes, extra_data_flags: int) -> int:
+    """计算 MOBI/KF8 文本记录尾部附加的 extra_data_flags 字节长度"""
+    if not extra_data_flags or not record:
+        return 0
+    size = len(record)
+    num = 0
+    flags = extra_data_flags >> 1
+    while flags:
+        if flags & 1:
+            pos = size - num - 1
+            val = 0
+            shift = 0
+            while pos >= 0 and shift < 28:
+                b = record[pos]
+                pos -= 1
+                val |= (b & 0x7F) << shift
+                shift += 7
+                if b & 0x80:
+                    break
+            num += val
+        flags >>= 1
+    if extra_data_flags & 1:
+        pos = size - num - 1
+        if pos >= 0:
+            num += (record[pos] & 0x03) + 1
+    return min(num, size)
+
+
+class HuffCdicDecompressor:
+    """Mobipocket HUFF / CDIC (compression=17480) 纯 Python 解压器"""
+
+    def __init__(self, huff_rec: bytes, cdic_recs: List[bytes]):
+        if not huff_rec.startswith(b"HUFF"):
+            raise ValueError("Invalid HUFF record magic")
+        off1, off2 = struct.unpack_from(">II", huff_rec, 8)
+
+        def _unpack_dict1(v: int) -> Tuple[int, int, int]:
+            codelen, term, maxcode = v & 0x1F, v & 0x80, v >> 8
+            maxcode = ((maxcode + 1) << (32 - codelen)) - 1 if codelen > 0 else 0xFFFFFFFF
+            return codelen, term, maxcode
+
+        raw_d1 = struct.unpack_from(">256I", huff_rec, off1)
+        self.dict1 = [_unpack_dict1(v) for v in raw_d1]
+
+        dict2 = struct.unpack_from(">64I", huff_rec, off2)
+        min_temp = [0]
+        max_temp = [0xFFFFFFFF]
+        for codelen, mc in enumerate(dict2[0::2], start=1):
+            min_temp.append((mc << (32 - codelen)) & 0xFFFFFFFF)
+        for codelen, mc in enumerate(dict2[1::2], start=1):
+            max_temp.append((((mc + 1) << (32 - codelen)) - 1) & 0xFFFFFFFF)
+        self.mincode = tuple(min_temp)
+        self.maxcode = tuple(max_temp)
+
+        self.dictionary: List[List[Any]] = []
+        for cdic in cdic_recs:
+            if not cdic.startswith(b"CDIC"):
+                continue
+            phrases, bits = struct.unpack_from(">II", cdic, 8)
+            n = min(1 << bits, max(0, phrases - len(self.dictionary)))
+            if n <= 0 or 16 + n * 2 > len(cdic):
+                continue
+            offsets = struct.unpack_from(f">{n}H", cdic, 16)
+            for off in offsets:
+                abs_off = 16 + off
+                if abs_off + 2 > len(cdic):
+                    self.dictionary.append([b"", 1])
+                    continue
+                blen = struct.unpack_from(">H", cdic, abs_off)[0]
+                slice_len = blen & 0x7FFF
+                flag = blen & 0x8000
+                slice_data = cdic[abs_off + 2 : abs_off + 2 + slice_len]
+                self.dictionary.append([slice_data, flag])
+
+    def unpack(self, data: bytes, _depth: int = 0) -> bytes:
+        if not data or _depth > 16:
+            return b""
+        bits_left = len(data) * 8
+        padded = data + b"\x00" * 8
+        bitpos = 0
+        out = bytearray()
+
+        while bits_left > 0:
+            byte_idx = bitpos >> 3
+            bit_shift = bitpos & 7
+            val64 = struct.unpack_from(">Q", padded, byte_idx)[0]
+            code = ((val64 << bit_shift) >> 32) & 0xFFFFFFFF
+
+            codelen, term, maxcode = self.dict1[code >> 24]
+            if not term:
+                while codelen < 32 and code < self.mincode[codelen]:
+                    codelen += 1
+                maxcode = self.maxcode[codelen]
+
+            if codelen <= 0 or codelen > bits_left:
+                break
+
+            bitpos += codelen
+            bits_left -= codelen
+
+            r = (maxcode - code) >> (32 - codelen)
+            if r < 0 or r >= len(self.dictionary):
+                break
+            entry = self.dictionary[r]
+            if not entry[1]:
+                decoded = self.unpack(entry[0], _depth + 1)
+                entry[0] = decoded
+                entry[1] = 1
+            out.extend(entry[0])
+
+        return bytes(out)
+
+
 class MobiBook:
     """MOBI / AZW / AZW3 (KF8) 电子书解析器"""
 
@@ -82,15 +200,22 @@ class MobiBook:
 
         self.records = self._parse_pdb_records()
         self.header_info = self._parse_mobi_header()
-        self.is_kf8, self.epub_book, self.kf8_tmp_path = self._try_init_kf8()
+        self._external_tmpdir: Optional[str] = None
+        self.is_kf8, self.is_kf8_native, self.epub_book, self.kf8_tmp_path = self._try_init_kf8()
 
-        if not self.is_kf8:
+        if self.header_info.get("encryption_type", 0) != 0:
+            self.full_html = ""
+            self.toc = []
+        elif self.is_kf8 and self.epub_book:
+            self.full_html = ""
+            self.toc = self.epub_book.toc
+        elif self.is_kf8 and self.is_kf8_native:
+            self.full_html = self._extract_kf8_native_html()
+            self.toc = self._build_toc_from_html(self.full_html)
+        else:
             # 传统 Mobi6 HTML 处理
             self.full_html = self._extract_raw_html()
             self.toc = self._build_toc_from_html(self.full_html)
-        else:
-            self.full_html = ""
-            self.toc = self.epub_book.toc if self.epub_book else []
 
     def close(self):
         if self.epub_book:
@@ -100,6 +225,9 @@ class MobiBook:
                 os.remove(self.kf8_tmp_path)
             except Exception:
                 pass
+        if self._external_tmpdir and os.path.isdir(self._external_tmpdir):
+            shutil.rmtree(self._external_tmpdir, ignore_errors=True)
+            self._external_tmpdir = None
 
     def __enter__(self):
         return self
@@ -130,30 +258,67 @@ class MobiBook:
 
         return records
 
-    def _parse_mobi_header(self) -> Dict[str, Any]:
-        """解析 Record 0 获取 PalmDOC & MOBI 头部核心元数据"""
-        if not self.records:
+    def _parse_exth(self, rec0: bytes, exth_offset: int, encoding: str) -> Dict[str, Any]:
+        """解析 MOBI EXTH 扩展元数据块 (作者、出版社、语言、完整标题、KF8 Boundary)"""
+        ext: Dict[str, Any] = {}
+        if exth_offset + 12 > len(rec0) or rec0[exth_offset : exth_offset + 4] != b"EXTH":
+            return ext
+        exth_count = struct.unpack(">I", rec0[exth_offset + 8 : exth_offset + 12])[0]
+        pos = exth_offset + 12
+        authors = []
+        for _ in range(exth_count):
+            if pos + 8 > len(rec0):
+                break
+            rtype, rlen = struct.unpack(">II", rec0[pos : pos + 8])
+            if rlen < 8 or pos + rlen > len(rec0):
+                break
+            rdata = rec0[pos + 8 : pos + rlen]
+            pos += rlen
+            if rtype == 100:
+                val = rdata.decode(encoding, errors="replace").strip("\x00 ")
+                if val:
+                    authors.append(val)
+            elif rtype == 101:
+                ext["publisher"] = rdata.decode(encoding, errors="replace").strip("\x00 ")
+            elif rtype == 503:
+                ext["updated_title"] = rdata.decode(encoding, errors="replace").strip("\x00 ")
+            elif rtype == 524:
+                ext["language"] = rdata.decode(encoding, errors="replace").strip("\x00 ")
+            elif rtype == 121 and len(rdata) == 4:
+                ext["kf8_boundary"] = struct.unpack(">I", rdata)[0]
+        if authors:
+            ext["author"] = ", ".join(authors)
+        return ext
+
+    def _parse_header_record(self, rec: bytes) -> Dict[str, Any]:
+        """解析单个 PalmDOC + MOBI Header 记录（同时复用于 Record 0 与 KF8 二级头）"""
+        if len(rec) < 16:
             return {}
 
-        rec0 = self.records[0]
-        if len(rec0) < 16:
-            return {}
-
-        compression = struct.unpack(">H", rec0[0:2])[0]
-        text_length = struct.unpack(">I", rec0[4:8])[0]
-        text_records_count = struct.unpack(">H", rec0[8:10])[0]
-        record_size = struct.unpack(">H", rec0[10:12])[0]
+        compression = struct.unpack(">H", rec[0:2])[0]
+        text_length = struct.unpack(">I", rec[4:8])[0]
+        text_records_count = struct.unpack(">H", rec[8:10])[0]
+        record_size = struct.unpack(">H", rec[10:12])[0]
+        raw_enc = struct.unpack(">H", rec[12:14])[0]
+        is_std_mobi_hdr = len(rec) >= 24 and rec[16:20] == b"MOBI"
+        encryption_type = raw_enc if (is_std_mobi_hdr and raw_enc in (1, 2)) else 0
 
         encoding = "utf-8"
         first_image_index = None
+        huff_offset = None
+        huff_count = 0
+        extra_data_flags = 0
+        file_version = 0
+        header_len = 0
         has_kf8_boundary = False
         kf8_boundary_offset = -1
+        fdst_offset = None
+        exth_meta: Dict[str, Any] = {}
 
-        # 检查是否包含 MOBI 标识
-        if len(rec0) >= 24 and rec0[16:20] == b"MOBI":
-            header_len = struct.unpack(">I", rec0[20:24])[0]
-            mobi_type = struct.unpack(">I", rec0[24:28])[0] if len(rec0) >= 28 else 0
-            codepage = struct.unpack(">I", rec0[28:32])[0] if len(rec0) >= 32 else 1252
+        if is_std_mobi_hdr:
+            header_len = struct.unpack(">I", rec[20:24])[0]
+            codepage = struct.unpack(">I", rec[28:32])[0] if len(rec) >= 32 else 1252
+            file_version = struct.unpack(">I", rec[36:40])[0] if len(rec) >= 40 else 0
 
             if codepage == 65001:
                 encoding = "utf-8"
@@ -162,26 +327,46 @@ class MobiBook:
             elif codepage == 936:
                 encoding = "gbk"
 
-            if len(rec0) >= 112:
-                first_image_index = struct.unpack(">I", rec0[108:112])[0]
+            if len(rec) >= 112:
+                raw_img_idx = struct.unpack(">I", rec[108:112])[0]
+                if 0 < raw_img_idx < len(self.records):
+                    first_image_index = raw_img_idx
 
-            if len(rec0) >= 136:
-                exth_flags = struct.unpack(">I", rec0[128:132])[0]
-                if exth_flags & 0x40:
-                    pass
+            if len(rec) >= 120:
+                h_off, h_cnt = struct.unpack(">II", rec[112:120])
+                if 0 < h_off < len(self.records) and h_cnt >= 2:
+                    huff_offset, huff_count = h_off, h_cnt
 
-            if len(rec0) >= 196:
-                boundary_rec = struct.unpack(">I", rec0[192:196])[0]
-                if boundary_rec != 0xFFFFFFFF and boundary_rec < len(self.records):
+            if len(rec) >= 132:
+                exth_flags = struct.unpack(">I", rec[128:132])[0]
+                if exth_flags & 0x40 and header_len > 0:
+                    exth_meta = self._parse_exth(rec, 16 + header_len, encoding)
+
+            if len(rec) >= 196:
+                rec192 = struct.unpack(">I", rec[192:196])[0]
+                if 0 < rec192 < len(self.records):
+                    target_rec = self.records[rec192]
+                    if file_version >= 8 and target_rec.startswith(b"FDST"):
+                        fdst_offset = rec192
+                    elif file_version < 8 and target_rec.startswith(b"BOUNDARY"):
+                        has_kf8_boundary = True
+                        kf8_boundary_offset = rec192
+
+            if exth_meta.get("kf8_boundary") is not None:
+                b_rec = exth_meta["kf8_boundary"]
+                if 0 < b_rec < len(self.records):
                     has_kf8_boundary = True
-                    kf8_boundary_offset = boundary_rec
+                    kf8_boundary_offset = b_rec
 
-        title = ""
-        if len(rec0) >= 88:
-            full_name_offset = struct.unpack(">I", rec0[84:88])[0]
-            full_name_length = struct.unpack(">I", rec0[88:92])[0] if len(rec0) >= 92 else 0
-            if full_name_offset < len(rec0) and full_name_offset + full_name_length <= len(rec0):
-                raw_name = rec0[full_name_offset:full_name_offset + full_name_length]
+            if header_len >= 228 and len(rec) >= 244:
+                extra_data_flags = struct.unpack(">H", rec[242:244])[0]
+
+        title = exth_meta.get("updated_title", "")
+        if not title and len(rec) >= 92:
+            full_name_offset = struct.unpack(">I", rec[84:88])[0]
+            full_name_length = struct.unpack(">I", rec[88:92])[0]
+            if full_name_offset < len(rec) and full_name_offset + full_name_length <= len(rec):
+                raw_name = rec[full_name_offset : full_name_offset + full_name_length]
                 try:
                     title = raw_name.decode(encoding, errors="replace").strip()
                 except Exception:
@@ -193,18 +378,41 @@ class MobiBook:
 
         return {
             "title": title,
+            "author": exth_meta.get("author", ""),
+            "publisher": exth_meta.get("publisher", ""),
+            "language": exth_meta.get("language", ""),
             "compression": compression,
+            "encryption_type": encryption_type,
             "text_length": text_length,
             "text_records_count": text_records_count,
             "record_size": record_size,
             "encoding": encoding,
+            "file_version": file_version,
+            "extra_data_flags": extra_data_flags,
+            "huff_offset": huff_offset,
+            "huff_count": huff_count,
             "first_image_index": first_image_index,
+            "fdst_offset": fdst_offset,
             "has_kf8_boundary": has_kf8_boundary,
             "kf8_boundary_offset": kf8_boundary_offset,
         }
 
-    def _try_init_kf8(self) -> Tuple[bool, Optional[EpubBook], Optional[str]]:
-        """检测并尝试从 AZW3/KF8 复合体中提取完整的 EPUB 容器"""
+    def _parse_mobi_header(self) -> Dict[str, Any]:
+        """解析 Record 0 获取 PalmDOC & MOBI 头部核心元数据"""
+        if not self.records:
+            return {}
+        return self._parse_header_record(self.records[0])
+
+    def _try_init_kf8(self) -> Tuple[bool, bool, Optional[EpubBook], Optional[str]]:
+        """检测并初始化 AZW3/KF8：优先原生解析 standalone/BOUNDARY+MOBI(v8)，次选嵌套 ZIP 或外部 mobi 库"""
+        self.kf8_header_idx = 0
+        self.kf8_header_info = self.header_info
+
+        # 1. 纯 AZW3 (Standalone KF8: Record 0 本身即 file_version >= 8)
+        if self.header_info.get("file_version", 0) >= 8 and self.header_info.get("text_records_count", 0) > 0:
+            return True, True, None, None
+
+        # 2. 复合体 BOUNDARY
         kf8_start = -1
         if self.header_info.get("has_kf8_boundary"):
             kf8_start = self.header_info["kf8_boundary_offset"]
@@ -215,7 +423,23 @@ class MobiBook:
                     kf8_start = i
                     break
 
-        if kf8_start >= 0 and kf8_start < len(self.records):
+        if 0 < kf8_start < len(self.records):
+            # 2a. BOUNDARY 后紧跟原生 KF8 MOBI 头记录
+            kf8_hdr_idx = kf8_start + 1 if self.records[kf8_start].startswith(b"BOUNDARY") else kf8_start
+            if kf8_hdr_idx < len(self.records):
+                cand_rec = self.records[kf8_hdr_idx]
+                if len(cand_rec) >= 40 and cand_rec[16:20] == b"MOBI":
+                    kf8_info = self._parse_header_record(cand_rec)
+                    if kf8_info.get("file_version", 0) >= 8 and kf8_info.get("text_records_count", 0) > 0:
+                        self.kf8_header_idx = kf8_hdr_idx
+                        self.kf8_header_info = kf8_info
+                        # 补充主头缺失的 EXTH 元数据
+                        for key in ("title", "author", "publisher", "language"):
+                            if not kf8_info.get(key) and self.header_info.get(key):
+                                kf8_info[key] = self.header_info[key]
+                        return True, True, None, None
+
+            # 2b. 嵌套 EPUB ZIP 容器兜底
             try:
                 for rec in self.records[kf8_start:]:
                     if rec.startswith(b"PK\x03\x04"):
@@ -224,36 +448,56 @@ class MobiBook:
                         tmp.close()
                         try:
                             epub = EpubBook(tmp.name)
-                            return True, epub, tmp.name
+                            return True, False, epub, tmp.name
                         except Exception:
                             if os.path.exists(tmp.name):
                                 os.remove(tmp.name)
             except Exception:
                 pass
 
+        # 3. 第三方 mobi 库兜底（记录 tmpdir 以便 close() 时彻底清理）
         try:
             import mobi
             tmpdir, filepath = mobi.extract(self.mobi_path)
+            self._external_tmpdir = tmpdir
             if filepath.lower().endswith(".epub") and os.path.exists(filepath):
                 epub = EpubBook(filepath)
-                return True, epub, None
+                return True, False, epub, None
         except Exception:
             pass
 
-        return False, None, None
+        return False, False, None, None
 
-    def _extract_raw_html(self) -> str:
-        """解压 Record 1..N 获取 Mobi6 原始 HTML 文本"""
-        compression = self.header_info.get("compression", 1)
-        text_records_count = self.header_info.get("text_records_count", 0)
-        encoding = self.header_info.get("encoding", "utf-8")
+    def _decompress_records(self, start_rec: int, count: int, header: Dict[str, Any]) -> bytes:
+        """统一解压 Mobi6 或原生 KF8 文本记录流（自动剥离 extra_data_flags 与支持 HUFF/CDIC）"""
+        compression = header.get("compression", 1)
+        extra_flags = header.get("extra_data_flags", 0)
+
+        huff_decoder = None
+        if compression == 17480:
+            huff_off = header.get("huff_offset")
+            huff_cnt = header.get("huff_count", 0)
+            if huff_off is not None and huff_cnt >= 2 and huff_off + huff_cnt <= len(self.records):
+                huff_rec = self.records[huff_off]
+                cdic_recs = self.records[huff_off + 1 : huff_off + huff_cnt]
+                huff_decoder = HuffCdicDecompressor(huff_rec, cdic_recs)
+            else:
+                raise RuntimeError("MOBI uses HUFF/CDIC compression (17480) but valid HUFF/CDIC records are missing.")
 
         decompressed_chunks = []
-        for i in range(1, min(text_records_count + 1, len(self.records))):
+        end_rec = min(start_rec + count, len(self.records))
+        for i in range(start_rec, end_rec):
             rec = self.records[i]
-            if compression == 2:  # PalmDOC LZ77
+            if extra_flags:
+                trail = _get_trailing_data_size(rec, extra_flags)
+                if 0 < trail < len(rec):
+                    rec = rec[:-trail]
+
+            if compression == 17480 and huff_decoder is not None:
+                decompressed_chunks.append(huff_decoder.unpack(rec))
+            elif compression == 2:
                 decompressed_chunks.append(decompress_palmdoc(rec))
-            elif compression == 1:  # 无压缩
+            elif compression == 1:
                 decompressed_chunks.append(rec)
             else:
                 try:
@@ -261,7 +505,37 @@ class MobiBook:
                 except Exception:
                     decompressed_chunks.append(rec)
 
-        full_bytes = b"".join(decompressed_chunks)
+        return b"".join(decompressed_chunks)
+
+    def _extract_kf8_native_html(self) -> str:
+        """提取原生 AZW3/KF8 主 HTML 流（结合 FDST 表仅截取主文档流，剔除内嵌 CSS 等辅助流）"""
+        hdr = self.kf8_header_info
+        start_rec = self.kf8_header_idx + 1
+        count = hdr.get("text_records_count", 0)
+        encoding = hdr.get("encoding", "utf-8")
+        full_bytes = self._decompress_records(start_rec, count, hdr)
+
+        fdst_off = hdr.get("fdst_offset")
+        if fdst_off is not None and 0 <= fdst_off < len(self.records):
+            fdst_rec = self.records[fdst_off]
+            if len(fdst_rec) >= 20 and fdst_rec.startswith(b"FDST"):
+                flow_off = struct.unpack_from(">I", fdst_rec, 4)[0]
+                num_flows = struct.unpack_from(">I", fdst_rec, 8)[0]
+                if num_flows >= 1 and flow_off + 8 <= len(fdst_rec):
+                    f_start, f_end = struct.unpack_from(">II", fdst_rec, flow_off)
+                    if 0 <= f_start < f_end <= len(full_bytes):
+                        full_bytes = full_bytes[f_start:f_end]
+
+        try:
+            return full_bytes.decode(encoding, errors="replace")
+        except Exception:
+            return full_bytes.decode("utf-8", errors="replace")
+
+    def _extract_raw_html(self) -> str:
+        """解压 Record 1..N 获取 Mobi6 原始 HTML 文本"""
+        count = self.header_info.get("text_records_count", 0)
+        encoding = self.header_info.get("encoding", "utf-8")
+        full_bytes = self._decompress_records(1, count, self.header_info)
         try:
             return full_bytes.decode(encoding, errors="replace")
         except Exception:
@@ -375,6 +649,7 @@ class MobiBook:
 
     def get_probe_info(self) -> Dict[str, Any]:
         """获取元数据探针报告"""
+        is_drm = self.header_info.get("encryption_type", 0) != 0
         if self.is_kf8 and self.epub_book:
             info = self.epub_book.get_probe_info()
             info["format"] = "AZW3 / MOBI (KF8)"
@@ -382,17 +657,27 @@ class MobiBook:
             info["recommendation"] = "KF8 Container -> Native HTML/Markdown (0.05s, 0 Token)"
             return info
 
+        hdr = self.kf8_header_info if (self.is_kf8 and self.is_kf8_native) else self.header_info
         return {
             "file": os.path.basename(self.mobi_path),
             "path": self.mobi_path,
-            "format": "MOBI (PalmDOC/Mobi6)",
-            "is_digital": True,
-            "title": self.header_info.get("title", ""),
+            "format": "AZW3 / MOBI (KF8)" if self.is_kf8 else "MOBI (PalmDOC/Mobi6)",
+            "is_digital": not is_drm,
+            "is_drm": is_drm,
+            "title": hdr.get("title", ""),
+            "author": hdr.get("author", ""),
+            "publisher": hdr.get("publisher", ""),
+            "language": hdr.get("language", ""),
+            "compression": hdr.get("compression", 1),
             "total_chars": len(self.full_html) if self.full_html else 0,
             "has_toc": len(self.toc) > 0,
             "toc_count": len(self.toc),
-            "category": "M (Reflowable MOBI)",
-            "recommendation": "Pure Python PalmDOC LZ77 unpack -> HTML to Markdown (0.05s, 0 Token)",
+            "category": "DRM-Protected MOBI/AZW3" if is_drm else ("M (Kindle KF8/AZW3)" if self.is_kf8 else "M (Reflowable MOBI)"),
+            "recommendation": (
+                f"DRM detected (encryption_type={self.header_info.get('encryption_type')}); remove DRM before extraction."
+                if is_drm
+                else "Pure Python PalmDOC/HUFF unpack -> HTML to Markdown (0.05s, 0 Token)"
+            ),
             "toc_sample": [
                 {"index": item["index"], "level": item["level"], "title": item["title"]}
                 for item in self.toc[:10]
@@ -431,7 +716,10 @@ class MobiBook:
 
     def get_image_by_recindex(self, recindex: int) -> Optional[bytes]:
         """根据 recindex 编号从 PDB Records 中抽取图片原始二进制"""
-        first_img_idx = self.header_info.get("first_image_index")
+        hdr = getattr(self, "kf8_header_info", None) if (self.is_kf8 and getattr(self, "is_kf8_native", False)) else self.header_info
+        first_img_idx = hdr.get("first_image_index") if hdr else None
+        if first_img_idx is None:
+            first_img_idx = self.header_info.get("first_image_index")
         if first_img_idx is None:
             return None
         target_idx = first_img_idx + recindex - 1
@@ -439,48 +727,67 @@ class MobiBook:
             return self.records[target_idx]
         return None
 
+    def _get_chapter_raw_html(self, chapter_info: Dict[str, Any]) -> str:
+        """按 next_level <= current_level 精确切分章节 HTML 区间（统一图片抽取与 Markdown 导出边界）"""
+        if self.header_info.get("encryption_type", 0) != 0:
+            raise RuntimeError(
+                f"MOBI/AZW3 file '{os.path.basename(self.mobi_path)}' is DRM encrypted "
+                f"(encryption_type={self.header_info.get('encryption_type')}) and cannot be extracted."
+            )
+        if not self.full_html:
+            return ""
+        idx = chapter_info["index"] - 1
+        current_level = chapter_info.get("level", 1)
+        start_offset = chapter_info.get("char_offset", 0)
+        end_offset = len(self.full_html)
+        for next_item in self.toc[idx + 1:]:
+            if next_item.get("level", 1) <= current_level:
+                end_offset = next_item.get("char_offset", len(self.full_html))
+                break
+        return self.full_html[start_offset:end_offset]
+
+    def _resolve_img_recindex(self, img_tag) -> Optional[int]:
+        """从 <img> 提取 recindex 或 KF8 kindle:embed:XXXX 索引"""
+        rec_val = img_tag.get("recindex") if hasattr(img_tag, "get") else None
+        if rec_val:
+            try:
+                return int(rec_val)
+            except ValueError:
+                pass
+        src = img_tag.get("src", "") if hasattr(img_tag, "get") else ""
+        m = re.search(r"kindle:embed:([0-9A-Za-z]+)", str(src))
+        if m:
+            try:
+                return int(m.group(1), 32)
+            except ValueError:
+                pass
+        return None
+
     def extract_chapter_images(self, chapter_info: Dict[str, Any], output_dir: Optional[str] = None) -> List[Dict[str, Any]]:
         """提取目标章节涉及的所有插图资源 (支持 Mobi6 与 KF8)"""
         if self.is_kf8 and self.epub_book:
             return self.epub_book.extract_chapter_images(chapter_info, output_dir)
 
-        if not self.full_html:
+        chapter_html = self._get_chapter_raw_html(chapter_info)
+        if not chapter_html:
             return []
 
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
-        idx = chapter_info["index"] - 1
-        start_offset = chapter_info.get("char_offset", 0)
-        end_offset = len(self.full_html)
-        if idx + 1 < len(self.toc):
-            end_offset = self.toc[idx + 1].get("char_offset", len(self.full_html))
-
-        chapter_html = self.full_html[start_offset:end_offset]
         extracted = []
-
         if BeautifulSoup:
             soup = BeautifulSoup(chapter_html, "html.parser")
             imgs = soup.find_all("img")
         else:
             imgs = []
             for m in re.finditer(r'<img[^>]+recindex=[\"\']?(\d+)[\"\']?[^>]*>', chapter_html, re.I):
-                imgs.append({"recindex": m.group(1), "alt": ""})
+                imgs.append({"recindex": m.group(1), "alt": "", "src": ""})
 
         for i, img_tag in enumerate(imgs):
-            if hasattr(img_tag, "get"):
-                rec_val = img_tag.get("recindex")
-                alt_val = img_tag.get("alt", "")
-            else:
-                rec_val = img_tag.get("recindex")
-                alt_val = img_tag.get("alt", "")
-
-            if not rec_val:
-                continue
-
-            try:
-                rec_idx = int(rec_val)
-            except ValueError:
+            alt_val = img_tag.get("alt", "") if hasattr(img_tag, "get") else ""
+            rec_idx = self._resolve_img_recindex(img_tag)
+            if rec_idx is None:
                 continue
 
             img_bytes = self.get_image_by_recindex(rec_idx)
@@ -513,57 +820,43 @@ class MobiBook:
         ocr: bool = False,
         ocr_engine: Optional[str] = None,
     ) -> str:
-        """提取目标章节并转换为 Markdown (支持插图导出与 OCR 智能回填)"""
+        """提取目标章节并转换为 Markdown (支持围栏代码保真、插图导出与 OCR 智能回填)"""
         if self.is_kf8 and self.epub_book:
             return self.epub_book.extract_chapter_markdown(
                 chapter_info, dump_images_dir=dump_images_dir, ocr=ocr, ocr_engine=ocr_engine
             )
 
-        if not self.full_html:
+        chapter_html = self._get_chapter_raw_html(chapter_info)
+        if not chapter_html:
             return ""
 
         if dump_images_dir:
             os.makedirs(dump_images_dir, exist_ok=True)
 
-        idx = chapter_info["index"] - 1
-        current_level = chapter_info.get("level", 1)
-        start_offset = chapter_info.get("char_offset", 0)
-        end_offset = len(self.full_html)
-
-        for next_item in self.toc[idx + 1:]:
-            next_level = next_item.get("level", 1)
-            if next_level <= current_level:
-                end_offset = next_item.get("char_offset", len(self.full_html))
-                break
-
-        chapter_html = self.full_html[start_offset:end_offset]
         title = chapter_info.get("title", "")
-        placeholders = {}
+        placeholders: Dict[str, str] = {}
+        code_placeholders: Dict[str, str] = {}
         processed_html = chapter_html
 
         if BeautifulSoup:
             soup = BeautifulSoup(chapter_html, "html.parser")
             purge_useless_navigation(soup)
             convert_soup_mathml_to_latex(soup)
-            enhance_pre_code_tags(soup)
+            enhance_pre_code_tags(soup, code_placeholders=code_placeholders)
 
             imgs = soup.find_all("img")
             pending_ocr_tasks = []
 
             for i, img in enumerate(imgs):
-                rec_val = img.get("recindex")
                 alt_raw = img.get("alt", "").strip()
                 if alt_raw:
                     clean_name = os.path.basename(alt_raw.replace("\\", "/"))
                     alt_val = clean_name if clean_name else f"插图 {i + 1}"
                 else:
                     alt_val = f"插图 {i + 1}"
-                if not rec_val:
-                    continue
 
-                try:
-                    rec_idx = int(rec_val)
-                except ValueError:
+                rec_idx = self._resolve_img_recindex(img)
+                if rec_idx is None:
                     continue
 
                 img_bytes = self.get_image_by_recindex(rec_idx)
@@ -580,7 +873,7 @@ class MobiBook:
                         f.write(img_bytes)
 
                 if ocr:
-                    ph_key = f"__MOBI_OCR_PLACEHOLDER_{i}__"
+                    ph_key = f"MOBIOCRPLACEHOLDERTOKEN{i}END"
                     pending_ocr_tasks.append((ph_key, alt_val or f"插图 {i + 1}", saved_path, img_bytes))
                     p_tag = soup.new_tag("p")
                     p_tag.string = ph_key
@@ -609,10 +902,15 @@ class MobiBook:
         else:
             md = re.sub(r"<[^>]+>", "", processed_html).strip()
 
+        for ph_key, block in code_placeholders.items():
+            md = md.replace(ph_key, f"\n{block.strip()}\n")
+
         for ph_key, block in placeholders.items():
             md = md.replace(ph_key, block)
 
-        if title and not md.startswith("# "):
+        md = re.sub(r"\n{3,}", "\n\n", md).strip()
+
+        if title and not re.match(r"^\s*#\s+", md):
             md = f"# {title}\n\n{md}"
 
         return md
