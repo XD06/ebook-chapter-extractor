@@ -27,25 +27,37 @@ def mathml_node_to_latex(node) -> str:
         text = _clean_text(node.get_text())
         # 特殊希腊字母映射
         greek = {
-            "α": r"\alpha", "β": r"\beta", "γ": r"\gamma", "θ": r"\theta",
-            "λ": r"\lambda", "μ": r"\mu", "π": r"\pi", "σ": r"\sigma",
-            "ω": r"\omega", "Δ": r"\Delta", "Σ": r"\Sigma", "Ω": r"\Omega"
+            "α": r"\alpha", "β": r"\beta", "γ": r"\gamma", "δ": r"\delta",
+            "ε": r"\epsilon", "ζ": r"\zeta", "η": r"\eta", "θ": r"\theta",
+            "ι": r"\iota", "κ": r"\kappa", "λ": r"\lambda", "μ": r"\mu",
+            "ν": r"\nu", "ξ": r"\xi", "π": r"\pi", "ρ": r"\rho",
+            "σ": r"\sigma", "τ": r"\tau", "υ": r"\upsilon", "φ": r"\phi",
+            "χ": r"\chi", "ψ": r"\psi", "ω": r"\omega",
+            "Γ": r"\Gamma", "Δ": r"\Delta", "Θ": r"\Theta", "Λ": r"\Lambda",
+            "Ξ": r"\Xi", "Π": r"\Pi", "Σ": r"\Sigma", "Φ": r"\Phi",
+            "Ψ": r"\Psi", "Ω": r"\Omega",
         }
         return greek.get(text, text)
 
     elif tag == "mo":
         text = _clean_text(node.get_text())
         op_map = {
-            "≤": r"\le ", "≥": r"\ge ", "≠": r"\ne ", "±": r"\pm ",
-            "×": r"\times ", "÷": r"\div ", "∈": r"\in ", "∉": r"\notin ",
+            "≤": r"\le ", "≥": r"\ge ", "≠": r"\ne ", "≈": r"\approx ",
+            "≡": r"\equiv ", "∝": r"\propto ", "±": r"\pm ", "∓": r"\mp ",
+            "×": r"\times ", "÷": r"\div ", "·": r"\cdot ", "∈": r"\in ", "∉": r"\notin ",
             "⊂": r"\subset ", "∪": r"\cup ", "∩": r"\cap ", "→": r"\to ",
-            "∞": r"\infty ", "∑": r"\sum ", "∏": r"\prod ", "∫": r"\int "
+            "⇒": r"\Rightarrow ", "⇔": r"\Leftrightarrow ",
+            "∞": r"\infty ", "∑": r"\sum ", "∏": r"\prod ", "∫": r"\int ",
+            "∂": r"\partial ", "∇": r"\nabla ",
         }
         return op_map.get(text, f" {text} " if text in ("+", "-", "=", "<", ">") else text)
 
     elif tag == "mtext":
         text = _clean_text(node.get_text())
         return f"\\text{{{text}}}"
+
+    elif tag == "mspace":
+        return " "
 
     elif tag == "msup":
         children = [c for c in node.children if getattr(c, "name", None) or _clean_text(str(c))]
@@ -92,7 +104,56 @@ def mathml_node_to_latex(node) -> str:
             return f"\\sqrt[{deg}]{{{base}}}"
         return "".join(mathml_node_to_latex(c) for c in children)
 
-    elif tag in ("mrow", "mstyle", "semantics", "math"):
+    elif tag == "mover":
+        children = [c for c in node.children if getattr(c, "name", None) or _clean_text(str(c))]
+        if len(children) >= 2:
+            base = mathml_node_to_latex(children[0])
+            top = mathml_node_to_latex(children[1])
+            accent_map = {"¯": r"\bar", "ˆ": r"\hat", "^": r"\hat", "~": r"\tilde", "→": r"\vec"}
+            if top.strip() in accent_map:
+                return f"{accent_map[top.strip()]}{{{base}}}"
+            return f"\\overset{{{top}}}{{{base}}}"
+        return "".join(mathml_node_to_latex(c) for c in children)
+
+    elif tag == "munder":
+        children = [c for c in node.children if getattr(c, "name", None) or _clean_text(str(c))]
+        if len(children) >= 2:
+            base = mathml_node_to_latex(children[0])
+            bot = mathml_node_to_latex(children[1])
+            if any(op in base for op in (r"\sum", r"\prod", r"\lim", r"\max", r"\min")):
+                return f"{base}_{{{bot}}}"
+            return f"\\underset{{{bot}}}{{{base}}}"
+        return "".join(mathml_node_to_latex(c) for c in children)
+
+    elif tag == "munderover":
+        children = [c for c in node.children if getattr(c, "name", None) or _clean_text(str(c))]
+        if len(children) >= 3:
+            base = mathml_node_to_latex(children[0])
+            bot = mathml_node_to_latex(children[1])
+            top = mathml_node_to_latex(children[2])
+            return f"{base}_{{{bot}}}^{{{top}}}"
+        return "".join(mathml_node_to_latex(c) for c in children)
+
+    elif tag == "mtable":
+        rows_latex = []
+        for r in node.find_all(lambda t: getattr(t, "name", None) and t.name.split(":")[-1].lower() == "mtr", recursive=False):
+            cells = [
+                mathml_node_to_latex(c)
+                for c in r.find_all(lambda t: getattr(t, "name", None) and t.name.split(":")[-1].lower() == "mtd", recursive=False)
+            ]
+            if cells:
+                rows_latex.append(" & ".join(cells))
+        if rows_latex:
+            return r"\begin{matrix}" + r" \\ ".join(rows_latex) + r"\end{matrix}"
+        return "".join(mathml_node_to_latex(c) for c in getattr(node, "children", []))
+
+    elif tag == "menclose":
+        inner = "".join(mathml_node_to_latex(c) for c in node.children)
+        if "box" in (node.get("notation") or "").lower():
+            return f"\\boxed{{{inner}}}"
+        return inner
+
+    elif tag in ("mrow", "mstyle", "semantics", "math", "mpadded"):
         inner = "".join(mathml_node_to_latex(c) for c in node.children)
         if tag == "math":
             display = node.get("display") == "block" or node.get("mode") == "display"

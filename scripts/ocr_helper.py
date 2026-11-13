@@ -18,8 +18,8 @@ import re
 import json
 import time
 import tempfile
+import threading
 from typing import Optional, Union, Dict, Any, List
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 百度飞桨 PaddleOCR-VL 默认配置（不硬编码任何敏感 Token）
 DEFAULT_PADDLE_JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
@@ -122,22 +122,96 @@ def detect_ocr_engine() -> str:
 
 
 _RAPIDOCR_INSTANCE = None
+_RAPIDOCR_LOCK = threading.Lock()
 
 
 def get_rapidocr():
-    """获取 RapidOCR 引擎单例"""
+    """获取 RapidOCR 引擎单例（线程安全）"""
     global _RAPIDOCR_INSTANCE
     if _RAPIDOCR_INSTANCE is None:
-        try:
-            from rapidocr_onnxruntime import RapidOCR
-            _RAPIDOCR_INSTANCE = RapidOCR()
-        except Exception:
-            _RAPIDOCR_INSTANCE = False
+        with _RAPIDOCR_LOCK:
+            if _RAPIDOCR_INSTANCE is None:
+                try:
+                    from rapidocr_onnxruntime import RapidOCR
+                    _RAPIDOCR_INSTANCE = RapidOCR()
+                except Exception:
+                    _RAPIDOCR_INSTANCE = False
     return _RAPIDOCR_INSTANCE if _RAPIDOCR_INSTANCE is not False else None
 
 
-def ocr_image_rapidocr(image_input: Union[str, bytes]) -> str:
-    """使用本地 RapidOCR (ONNXRuntime) 进行极速离线文字提取"""
+def _format_rapidocr_boxes(result: list) -> str:
+    """按检测框 Y 坐标聚类与 X 坐标排序重组行文本，防止目录页码或表格行被拆碎"""
+    items = []
+    for entry in result:
+        if not entry or len(entry) < 2:
+            continue
+        box, text = entry[0], str(entry[1]).strip()
+        if not text:
+            continue
+        if isinstance(box, (list, tuple)) and len(box) >= 4:
+            xs = [pt[0] for pt in box]
+            ys = [pt[1] for pt in box]
+            x0, x1 = min(xs), max(xs)
+            y0, y1 = min(ys), max(ys)
+            h = max(1.0, y1 - y0)
+            items.append((0.5 * (y0 + y1), h, x0, x1, text))
+        else:
+            items.append((0.0, 12.0, 0.0, 0.0, text))
+
+    if not items:
+        return ""
+
+    # 若无有效坐标框，直接按序拼接
+    if all(it[1] == 12.0 and it[2] == 0.0 and it[3] == 0.0 for it in items):
+        return "\n".join(it[4] for it in items).strip()
+
+    items.sort(key=lambda it: (it[0], it[2]))
+    rows: List[List[tuple]] = []
+    row_meta: List[List[float]] = []  # [avg_yc, avg_h]
+
+    for it in items:
+        yc, h, x0, x1, text = it
+        placed = False
+        for idx in range(len(rows) - 1, -1, -1):
+            ryc, rh = row_meta[idx]
+            tol = max(6.0, 0.55 * min(h, rh))
+            if abs(yc - ryc) <= tol:
+                rows[idx].append(it)
+                n = len(rows[idx])
+                row_meta[idx][0] = (ryc * (n - 1) + yc) / n
+                row_meta[idx][1] = (rh * (n - 1) + h) / n
+                placed = True
+                break
+            if yc - ryc > max(20.0, 2.0 * rh):
+                break
+        if not placed:
+            rows.append([it])
+            row_meta.append([yc, h])
+
+    lines = []
+    for row in rows:
+        row.sort(key=lambda it: it[2])
+        parts = [row[0][4]]
+        prev_x1 = row[0][3]
+        prev_h = row[0][1]
+        for _, h, x0, x1, text in row[1:]:
+            gap = x0 - prev_x1
+            ref_h = max(1.0, min(prev_h, h))
+            if gap > 0.65 * ref_h:
+                parts.append("  " + text)
+            elif gap > 0.15 * ref_h or (parts[-1][-1].isascii() and text[0].isascii()):
+                parts.append(" " + text)
+            else:
+                parts.append(text)
+            prev_x1 = max(prev_x1, x1)
+            prev_h = h
+        lines.append("".join(parts))
+
+    return "\n".join(lines).strip()
+
+
+def ocr_image_rapidocr(image_input: Union[str, bytes, Any]) -> str:
+    """使用本地 RapidOCR (ONNXRuntime) 进行极速离线文字提取（带版面同行还原）"""
     engine = get_rapidocr()
     if not engine:
         return ""
@@ -145,8 +219,7 @@ def ocr_image_rapidocr(image_input: Union[str, bytes]) -> str:
         result, _ = engine(image_input)
         if not result:
             return ""
-        lines = [line[1] for line in result if line and len(line) >= 2]
-        return "\n".join(lines).strip()
+        return _format_rapidocr_boxes(result)
     except Exception as e:
         sys.stderr.write(f"RapidOCR error: {e}\n")
         return ""
@@ -165,18 +238,31 @@ def _create_pdf_from_images(image_list: List[Union[str, bytes]]) -> Optional[byt
     try:
         doc = pymupdf.open()
         for img_item in image_list:
-            if isinstance(img_item, bytes):
-                img_data = img_item
-            else:
-                with open(img_item, "rb") as f:
-                    img_data = f.read()
+            try:
+                if isinstance(img_item, bytes):
+                    img_data = img_item
+                else:
+                    with open(img_item, "rb") as f:
+                        img_data = f.read()
 
-            img_doc = pymupdf.open(stream=img_data, filetype=detect_image_ext(img_data).lstrip("."))
-            rect = img_doc[0].rect
-            page = doc.new_page(width=rect.width, height=rect.height)
-            page.insert_image(rect, stream=img_data)
-            img_doc.close()
+                if not img_data:
+                    continue
+                ext = detect_image_ext(img_data).lstrip(".")
+                img_doc = pymupdf.open(stream=img_data, filetype=ext)
+                rect = img_doc[0].rect
+                page = doc.new_page(width=rect.width, height=rect.height)
+                if ext == "svg":
+                    pix = img_doc[0].get_pixmap(dpi=150)
+                    page.insert_image(rect, stream=pix.tobytes("png"))
+                else:
+                    page.insert_image(rect, stream=img_data)
+                img_doc.close()
+            except Exception as item_err:
+                sys.stderr.write(f"[!] Skipping invalid image in PDF batch: {item_err}\n")
 
+        if doc.page_count == 0:
+            doc.close()
+            return None
         pdf_bytes = doc.tobytes()
         doc.close()
         return pdf_bytes
@@ -311,8 +397,9 @@ def ocr_images_paddle_batch(
         if jsonl_res.status_code != 200:
             return [ocr_image_rapidocr(img) for img in image_list]
 
+        jsonl_text = jsonl_res.content.decode("utf-8", errors="replace")
         page_texts: List[str] = []
-        for line in jsonl_res.text.strip().split("\n"):
+        for line in jsonl_text.strip().split("\n"):
             line = line.strip()
             if not line:
                 continue
@@ -400,24 +487,15 @@ def ocr_images_batch(
     if engine_name in ("paddleocr", "paddle", "paddle_ocr", "api") or (engine_name == "none" and get_paddle_token()):
         return ocr_images_paddle_batch(image_list)
 
-    # 本地 RapidOCR 多线程并发提取
-    if len(image_list) == 1:
-        return [ocr_image(image_list[0], engine_name="rapidocr")]
-
-    results = [""] * len(image_list)
-    max_workers = min(4, len(image_list))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(ocr_image_rapidocr, img): idx
-            for idx, img in enumerate(image_list)
-        }
-        for future in as_completed(future_map):
-            idx = future_map[future]
-            try:
-                results[idx] = future.result()
-            except Exception as e:
-                sys.stderr.write(f"[!] RapidOCR batch item {idx} failed: {e}\n")
-                results[idx] = ""
+    # 本地 RapidOCR 单 Session 顺序提取（避免多线程争抢 ONNXRuntime 内部线程池导致反降速）
+    get_rapidocr()
+    results = []
+    for idx, img in enumerate(image_list):
+        try:
+            results.append(ocr_image_rapidocr(img))
+        except Exception as e:
+            sys.stderr.write(f"[!] RapidOCR batch item {idx} failed: {e}\n")
+            results.append("")
 
     return results
 
@@ -442,27 +520,32 @@ def clean_ocr_text(text: str) -> str:
     lines = text.splitlines()
     cleaned = []
     for line in lines:
-        stripped = line.strip()
-        if not stripped:
+        stripped = line.rstrip()
+        if not stripped.strip():
             cleaned.append("")
             continue
 
-        # 修复注释符号拆分
-        stripped = re.sub(r"/\s+/", "//", stripped)
-        stripped = re.sub(r"/\s+\*", "/*", stripped)
-        stripped = re.sub(r"\*\s+/", "*/", stripped)
-        stripped = re.sub(r":\s*=", ":=", stripped)
-        stripped = re.sub(r"-\s+>", "->", stripped)
-        stripped = re.sub(r"=\s+=", "==", stripped)
-        stripped = re.sub(r"!=\s*", "!=", stripped)
-        stripped = re.sub(r"<=\s*", "<=", stripped)
-        stripped = re.sub(r">=\s*", ">=", stripped)
-        stripped = re.sub(r"<\s+<", "<<", stripped)
-        stripped = re.sub(r">\s+>", ">>", stripped)
+        # 保留行首缩进，仅清洗正文内容中的 OCR 断符
+        indent_len = len(stripped) - len(stripped.lstrip(" \t"))
+        indent = stripped[:indent_len]
+        body = stripped[indent_len:]
 
-        cleaned.append(stripped)
+        # 修复注释符号与运算符拆分（避免误伤 URL 中的 https://）
+        body = re.sub(r"(?<!:)/\s+/", "//", body)
+        body = re.sub(r"/\s+\*", "/*", body)
+        body = re.sub(r"\*\s+/", "*/", body)
+        body = re.sub(r":\s+=", ":=", body)
+        body = re.sub(r"-\s+>", "->", body)
+        body = re.sub(r"=\s+=", "==", body)
+        body = re.sub(r"!\s+=", "!=", body)
+        body = re.sub(r"<\s+=", "<=", body)
+        body = re.sub(r">\s+=", ">=", body)
+        body = re.sub(r"<\s+<", "<<", body)
+        body = re.sub(r">\s+>", ">>", body)
 
-    return "\n".join(cleaned).strip()
+        cleaned.append(indent + body)
+
+    return "\n".join(cleaned).strip("\r\n")
 
 
 def clean_code_ocr(code_text: str, language: str = "") -> str:
@@ -511,25 +594,31 @@ def format_ocr_markdown(ocr_raw_text: str, alt_text: str = "插图", image_rel_p
             return f"\n![{alt_text}]({image_rel_path})\n"
         return f"\n> *[插图: {alt_text}]*\n"
 
-    # 特征探测判断是否为代码块
-    code_patterns = [
-        r"#\s*include",
+    # 特征探测判断是否为代码块（避免普通正文因 URL 中的 // 或两个分号误判）
+    strong_code_patterns = [
+        r"#\s*include\b",
         r"\bdef\s+\w+\s*\(",
-        r"\bclass\s+\w+",
+        r"\bclass\s+\w+\s*[:{(]",
         r"\bint\s+main\s*\(",
         r"\bpublic\s+static\s+void\b",
         r"\bnamespace\s+\w+",
         r"\bcout\s*<<",
         r"\bcin\s*>>",
-        r"\breturn\s+[0-9a-zA-Z_\"]+;",
-        r"[{};]\s*$",
-        r"//.*",
-        r"/\*.*\*/"
+        r"\bprintf\s*\(",
+        r"\bfunction\s+\w+\s*\(",
+        r"\bimport\s+\w+(?:\s+from|\s*;|\s*$)",
     ]
-    is_code = False
-    matched_count = sum(1 for pat in code_patterns if re.search(pat, cleaned, re.MULTILINE))
-    if matched_count >= 1 or cleaned.count(";") >= 2 or cleaned.count("{") >= 1:
-        is_code = True
+    weak_code_patterns = [
+        r"\breturn\s+[^;\n]+;",
+        r"^\s*[{};]\s*$",
+        r"[;{}]\s*$",
+        r"(?<!:)//.*",
+        r"/\*.*\*/",
+    ]
+    strong_hits = sum(1 for pat in strong_code_patterns if re.search(pat, cleaned, re.MULTILINE))
+    weak_hits = sum(1 for pat in weak_code_patterns if re.search(pat, cleaned, re.MULTILINE))
+    semi_lines = sum(1 for l in cleaned.splitlines() if l.rstrip().endswith((";", "{", "}")))
+    is_code = (strong_hits >= 1) or (weak_hits >= 2 and semi_lines >= 2)
 
     # 识别编程语言
     lang = ""
